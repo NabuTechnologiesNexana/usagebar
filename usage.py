@@ -10,8 +10,8 @@ Sources (each is skipped silently when its credentials are not on this Mac):
             CLI and the IDE). Read from a running agy/Antigravity language server on
             localhost when there is one, else from the Cloud Code API with agy's Keychain
             token (refreshed with agy's own OAuth client, read from the agy binary).
-  codex   - OpenAI Codex CLI rate limits from ~/.codex/auth.json.  UNVERIFIED: written
-            from public descriptions of the endpoint, no Codex account was available.
+  codex   - OpenAI Codex CLI rate limits (ChatGPT login) from ~/.codex/auth.json, via the
+            endpoint CodexBar uses. Not yet exercised against a live account.
 
 Sends one macOS notification per limit per reset window when it crosses NOTIFY_AT.
 Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatible.
@@ -187,26 +187,35 @@ def gemini_gauges() -> list[dict]:
     return out
 
 
-# --- Codex (UNVERIFIED) -------------------------------------------------------
+# --- Codex ---------------------------------------------------------------------
+# Endpoint and response shape taken from CodexBar's CodexOAuthUsageFetcher.swift
+# (GET backend-api/wham/usage -> rate_limits.primary_window/secondary_window with
+# used_percent, reset_at epoch, limit_window_seconds). Not exercised against a live
+# Codex account yet - if it breaks, the row shows as a warning in the menu.
 
 def codex_gauges() -> list[dict]:
-    """Codex CLI (ChatGPT login) rate limits. Endpoint/shape from public write-ups of
-    CodexBar-style tools - adjust once someone with a Codex account can test it."""
     if not CODEX_AUTH.exists() or not shutil.which("codex"):  # stale auth.json without the CLI is common
         return []
-    tokens = json.loads(CODEX_AUTH.read_text())["tokens"]
-    data = http_json("https://chatgpt.com/backend-api/wham/usage",
-                     {"Authorization": f"Bearer {tokens['access_token']}", "ChatGPT-Account-Id": tokens.get("account_id", "")})
-    limits = data.get("rate_limits") or data
+    tokens = json.loads(CODEX_AUTH.read_text()).get("tokens") or {}
+    if not tokens.get("access_token"):
+        return []
+    headers = {"Authorization": f"Bearer {tokens['access_token']}", "User-Agent": "UsageBar"}
+    if tokens.get("account_id"):
+        headers["ChatGPT-Account-Id"] = tokens["account_id"]
+    req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.load(r)
     out = []
-    for key, label in (("primary_window", "Codex · 5 h"), ("secondary_window", "Codex · týždeň")):
-        win = limits.get(key)
+    for key in ("primary_window", "secondary_window"):
+        win = (data.get("rate_limits") or {}).get(key)
         if not win:
             continue
-        reset = win.get("reset_at") or win.get("resets_at")
+        seconds = win.get("limit_window_seconds") or 0
+        window = f"{round(seconds / 3600)} h" if seconds and seconds < 48 * 3600 else "týždeň"
+        reset = win.get("reset_at")
         if isinstance(reset, (int, float)):
             reset = datetime.fromtimestamp(reset, timezone.utc).isoformat()
-        out.append(gauge(f"codex:{key}", "X", label, win.get("used_percent", 0), reset, "codex"))
+        out.append(gauge(f"codex:{key}", "X", f"Codex · {window}", win.get("used_percent", 0), reset, "codex"))
     return out
 
 
