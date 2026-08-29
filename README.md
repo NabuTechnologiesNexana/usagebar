@@ -2,7 +2,8 @@
 
 macOS menubar gauge for AI-coding subscription limits: **Claude Code** (5 h session,
 weekly, weekly per-model), **Gemini / Antigravity** (`agy` CLI + IDE share one quota),
-and **Codex** (prepared, unverified). No dependencies: one Python script (system
+(5 h + weekly per model group — Gemini, and Claude/GPT used through Antigravity), and
+**Codex** (prepared, unverified). No dependencies: one Python script (system
 `/usr/bin/python3`) + one Swift file compiled with `swiftc`.
 
 ```
@@ -28,7 +29,7 @@ Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 | Source | Credentials (read only, never stored by this tool) | Endpoint |
 |---|---|---|
 | Claude | Keychain item `Claude Code-credentials` (written by Claude Code login) | `api.anthropic.com/api/oauth/usage` — same as `/usage` in Claude Code |
-| Gemini / Antigravity | Keychain item `gemini` / `antigravity` (written by `agy` login); refresh uses the OAuth client embedded in the `agy` binary | `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Gemini / Antigravity | none when an `agy` / Antigravity language server is running (localhost RPC, no auth); otherwise Keychain item `gemini` / `antigravity` (written by `agy` login), refresh via the OAuth client embedded in the `agy` binary | local `RetrieveUserQuotaSummary`, else `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` — the same 5 h + weekly per-group numbers the IDE shows |
 | Codex | `~/.codex/auth.json` (only when the `codex` CLI is installed) | `chatgpt.com/backend-api/wham/usage` — **untested**, adjust `codex_gauges()` |
 
 Tokens are sent only to their own vendor's API. A refreshed Gemini access token is
@@ -50,7 +51,7 @@ menu. Use it as a personal convenience, not as something to build a product on.
 | What | Where |
 |---|---|
 | Threshold for notifications | `NOTIFY_AT` in `usage.py` (or env `USAGEBAR_NOTIFY_AT`) |
-| Which Gemini models to show | `GEMINI_MODELS` in `usage.py` (see all bucket ids: run the endpoint, or `agy models`) |
+| Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
 | Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
 | Refresh interval | `refreshSeconds` in `UsageBar.swift` |
 | Colors | `color()` in `UsageBar.swift` (green < 50, orange < 80, red ≥ 80) |

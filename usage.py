@@ -6,9 +6,10 @@
 Sources (each is skipped silently when its credentials are not on this Mac):
   claude  - the endpoint Claude Code's /usage uses. OAuth token from the Keychain,
             sent only to api.anthropic.com. 5h session, weekly all-models, weekly per-model.
-  gemini  - Antigravity's Cloud Code quota (shared by the `agy` CLI and the Antigravity
-            IDE). Token from the Keychain item agy writes; refreshed with agy's own OAuth
-            client (read from the agy binary, nothing stored in this repo).
+  gemini  - Antigravity quota summary (5h + weekly per model group, shared by the `agy`
+            CLI and the IDE). Read from a running agy/Antigravity language server on
+            localhost when there is one, else from the Cloud Code API with agy's Keychain
+            token (refreshed with agy's own OAuth client, read from the agy binary).
   codex   - OpenAI Codex CLI rate limits from ~/.codex/auth.json.  UNVERIFIED: written
             from public descriptions of the endpoint, no Codex account was available.
 
@@ -22,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import urllib.parse
 import urllib.request
@@ -32,7 +34,6 @@ STATE_DIR = Path(os.environ.get("USAGEBAR_STATE", Path.home() / "Library/Applica
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
 GEMINI_TOKEN_CACHE = STATE_DIR / "gemini_token.json"
-GEMINI_MODELS = {"gemini-3.7-flash-tiered": "Gemini 3.7 Flash", "gemini-3.1-pro-high": "Gemini 3.1 Pro"}
 CODEX_AUTH = Path.home() / ".codex/auth.json"
 
 
@@ -88,13 +89,38 @@ def claude_gauges() -> list[dict]:
 
 
 # --- Gemini / Antigravity ----------------------------------------------------
+# Same data the Antigravity IDE shows: per model-group 5h + weekly windows.
+# 1. Any running agy / Antigravity language server answers on localhost without
+#    auth - preferred, nothing leaves the machine.
+# 2. Otherwise the Cloud Code summary endpoint with agy's token (identifying as
+#    the Antigravity client, the way CodexBar does it).
 
-def gemini_user_agent() -> str:
-    """The quota endpoint answers only to the Antigravity client, so identify as the
-    installed agy version - the same header agy itself sends."""
-    r = subprocess.run(["agy", "--version"], capture_output=True, text=True, timeout=10)
-    version = r.stdout.strip().split()[-1] if r.returncode == 0 and r.stdout.strip() else "1.1.22"
-    return f"antigravity/{version} darwin arm64"
+ANTIGRAVITY_RPC = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+ANTIGRAVITY_GROUPS = {"Gemini Models": "Gemini", "Claude and GPT models": "Antigravity Claude/GPT"}
+
+
+def antigravity_local_ports() -> list[int]:
+    r = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"], capture_output=True, text=True, timeout=10)
+    ports, cmd = [], ""
+    for line in r.stdout.splitlines():
+        if line.startswith("c"):
+            cmd = line[1:].lower()
+        elif line.startswith("n127.0.0.1:") and ("agy" in cmd or "language_server" in cmd or "antigravity" in cmd):
+            ports.append(int(line.rsplit(":", 1)[1]))
+    return sorted(set(ports))
+
+
+def antigravity_local_summary() -> dict | None:
+    for port in antigravity_local_ports():
+        for scheme in ("http", "https"):
+            try:
+                req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}{ANTIGRAVITY_RPC}", data=b"{}",
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=3, context=ssl._create_unverified_context()) as r:
+                    return json.load(r)["response"]
+            except Exception:
+                continue
+    return None
 
 
 def gemini_oauth_clients() -> list[tuple[str, str]]:
@@ -139,16 +165,26 @@ def gemini_token() -> str | None:
     raise RuntimeError("Gemini token expired and refresh failed - run `agy` once to log in again")
 
 
-def gemini_gauges() -> list[dict]:
+def antigravity_cloud_summary() -> dict | None:
     token = gemini_token()
     if not token:
+        return None
+    return http_json("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+                     {"Authorization": f"Bearer {token}", "User-Agent": "antigravity"}, b"{}")
+
+
+def gemini_gauges() -> list[dict]:
+    summary = antigravity_local_summary() or antigravity_cloud_summary()
+    if not summary:
         return []
-    quota = http_json("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-                      {"Authorization": f"Bearer {token}", "User-Agent": gemini_user_agent()}, b"{}")
-    by_id = {b["modelId"]: b for b in quota["buckets"]}
-    return [gauge(f"gemini:{mid}", "G", label, (1 - by_id[mid].get("remainingFraction", 1)) * 100,
-                  by_id[mid].get("resetTime"), "gemini")
-            for mid, label in GEMINI_MODELS.items() if mid in by_id]
+    out = []
+    for group in summary["groups"]:
+        name = ANTIGRAVITY_GROUPS.get(group["displayName"], group["displayName"])
+        for b in sorted(group["buckets"], key=lambda b: b.get("window") != "5h"):  # 5h row first
+            window = "5 h" if b.get("window") == "5h" else "týždeň"
+            out.append(gauge(f"antigravity:{b['bucketId']}", "G" if name == "Gemini" else "A", f"{name} · {window}",
+                             (1 - b.get("remainingFraction", 1)) * 100, b.get("resetTime"), "gemini"))
+    return out
 
 
 # --- Codex (UNVERIFIED) -------------------------------------------------------

@@ -9,7 +9,7 @@ struct Payload: Decodable { let gauges: [Gauge]; let errors: [String] }
 let scriptPath = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("usage.py").path
-let headline = ["claude:session", "gemini:gemini-3.7-flash-tiered", "codex:primary_window"]
+let headline = ["claude:session", "antigravity:gemini-5h", "codex:primary_window"]
 let refreshSeconds: TimeInterval = 300
 let groupTitles = ["claude": "CLAUDE", "gemini": "GEMINI (Antigravity)", "codex": "CODEX"]
 
