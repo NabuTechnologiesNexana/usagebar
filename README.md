@@ -36,6 +36,15 @@ cached in `~/Library/Application Support/UsageBar/` (mode 600). Nothing else lea
 the machine. All endpoints are internal/undocumented and may change without notice —
 a broken source shows as a `⚠` row in the menu, the others keep working.
 
+## Before you publish or fork this
+
+None of the endpoints here are documented or supported by their vendors. The tool
+reads **your own** limits with **your own** login, read-only, and sends each token
+only to that vendor's API. The Gemini source identifies itself as the installed
+`agy` client (that is what the quota endpoint expects); if Google or Anthropic
+change or close these endpoints the corresponding rows simply disappear from the
+menu. Use it as a personal convenience, not as something to build a product on.
+
 ## Tweaks
 
 | What | Where |

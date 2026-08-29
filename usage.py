@@ -32,7 +32,6 @@ STATE_DIR = Path(os.environ.get("USAGEBAR_STATE", Path.home() / "Library/Applica
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
 GEMINI_TOKEN_CACHE = STATE_DIR / "gemini_token.json"
-GEMINI_USER_AGENT = "antigravity/1.1.19 darwin arm64"  # quota endpoint answers only to the Antigravity client
 GEMINI_MODELS = {"gemini-3.7-flash-tiered": "Gemini 3.7 Flash", "gemini-3.1-pro-high": "Gemini 3.1 Pro"}
 CODEX_AUTH = Path.home() / ".codex/auth.json"
 
@@ -90,6 +89,14 @@ def claude_gauges() -> list[dict]:
 
 # --- Gemini / Antigravity ----------------------------------------------------
 
+def gemini_user_agent() -> str:
+    """The quota endpoint answers only to the Antigravity client, so identify as the
+    installed agy version - the same header agy itself sends."""
+    r = subprocess.run(["agy", "--version"], capture_output=True, text=True, timeout=10)
+    version = r.stdout.strip().split()[-1] if r.returncode == 0 and r.stdout.strip() else "1.1.22"
+    return f"antigravity/{version} darwin arm64"
+
+
 def gemini_oauth_clients() -> list[tuple[str, str]]:
     """OAuth client id/secret pairs embedded in the agy binary (public desktop-app credentials)."""
     agy = shutil.which("agy")
@@ -137,7 +144,7 @@ def gemini_gauges() -> list[dict]:
     if not token:
         return []
     quota = http_json("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-                      {"Authorization": f"Bearer {token}", "User-Agent": GEMINI_USER_AGENT}, b"{}")
+                      {"Authorization": f"Bearer {token}", "User-Agent": gemini_user_agent()}, b"{}")
     by_id = {b["modelId"]: b for b in quota["buckets"]}
     return [gauge(f"gemini:{mid}", "G", label, (1 - by_id[mid].get("remainingFraction", 1)) * 100,
                   by_id[mid].get("resetTime"), "gemini")
