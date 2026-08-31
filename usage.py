@@ -47,6 +47,20 @@ def parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(f"{m.group(1)}.{frac}{m.group(3)}")
 
 
+def find_binary(name: str) -> str | None:
+    """launchd gives the app a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so PATH lookup
+    alone misses Homebrew and ~/.local/bin installs - search the usual places explicitly."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in ("/opt/homebrew/bin", "/usr/local/bin", Path.home() / ".local/bin",
+                      Path.home() / "bin", "/usr/sbin", "/sbin"):
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def keychain(service: str, account: str | None = None) -> str | None:
     cmd = ["security", "find-generic-password", "-s", service, *(["-a", account] if account else []), "-w"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -100,7 +114,10 @@ ANTIGRAVITY_GROUPS = {"Gemini Models": "Gemini", "Claude and GPT models": "Antig
 
 
 def antigravity_local_ports() -> list[int]:
-    r = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"], capture_output=True, text=True, timeout=10)
+    lsof = find_binary("lsof")
+    if not lsof:
+        return []
+    r = subprocess.run([lsof, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"], capture_output=True, text=True, timeout=10)
     ports, cmd = [], ""
     for line in r.stdout.splitlines():
         if line.startswith("c"):
@@ -125,7 +142,7 @@ def antigravity_local_summary() -> dict | None:
 
 def gemini_oauth_clients() -> list[tuple[str, str]]:
     """OAuth client id/secret pairs embedded in the agy binary (public desktop-app credentials)."""
-    agy = shutil.which("agy")
+    agy = find_binary("agy")
     if not agy:
         return []
     blob = Path(agy).read_bytes()
@@ -194,7 +211,7 @@ def gemini_gauges() -> list[dict]:
 # Codex account yet - if it breaks, the row shows as a warning in the menu.
 
 def codex_gauges() -> list[dict]:
-    if not CODEX_AUTH.exists() or not shutil.which("codex"):  # stale auth.json without the CLI is common
+    if not CODEX_AUTH.exists() or not find_binary("codex"):  # stale auth.json without the CLI is common
         return []
     tokens = json.loads(CODEX_AUTH.read_text()).get("tokens") or {}
     if not tokens.get("access_token"):
