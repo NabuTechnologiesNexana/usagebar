@@ -189,7 +189,7 @@ def gemini_gauges() -> list[dict]:
 
 # --- Codex ---------------------------------------------------------------------
 # Endpoint and response shape taken from CodexBar's CodexOAuthUsageFetcher.swift
-# (GET backend-api/wham/usage -> rate_limits.primary_window/secondary_window with
+# (GET backend-api/wham/usage -> rate_limit.primary_window/secondary_window with
 # used_percent, reset_at epoch, limit_window_seconds). Not exercised against a live
 # Codex account yet - if it breaks, the row shows as a warning in the menu.
 
@@ -207,7 +207,7 @@ def codex_gauges() -> list[dict]:
         data = json.load(r)
     out = []
     for key in ("primary_window", "secondary_window"):
-        win = (data.get("rate_limits") or {}).get(key)
+        win = (data.get("rate_limit") or {}).get(key)
         if not win:
             continue
         seconds = win.get("limit_window_seconds") or 0
