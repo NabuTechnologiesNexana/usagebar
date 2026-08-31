@@ -17,6 +17,63 @@ func color(_ p: Int) -> NSColor {
     p >= 80 ? .systemRed : p >= 50 ? .systemOrange : .systemGreen
 }
 
+
+// Vendor marks, drawn as vectors so the app stays dependency-free and offline.
+// Simplified in-house renditions, not the official trademarked artwork.
+func vendorColor(_ group: String) -> NSColor {
+    switch group {
+    case "claude": return NSColor(srgbRed: 0.80, green: 0.47, blue: 0.36, alpha: 1)   // Anthropic clay
+    case "gemini": return NSColor(srgbRed: 0.34, green: 0.55, blue: 0.96, alpha: 1)   // Google blue
+    default: return NSColor(srgbRed: 0.45, green: 0.72, blue: 0.63, alpha: 1)         // OpenAI teal
+    }
+}
+
+func vendorGlyph(_ group: String, size: CGFloat, tint: NSColor? = nil) -> NSImage {
+    NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+        let c = NSPoint(x: rect.midX, y: rect.midY)
+        let r = rect.width / 2 - 0.5
+        (tint ?? vendorColor(group)).setStroke()
+        (tint ?? vendorColor(group)).setFill()
+        switch group {
+        case "claude":                                    // radiating burst
+            let spokes = 10
+            let path = NSBezierPath()
+            for i in 0..<spokes {
+                let a = CGFloat(i) * .pi * 2 / CGFloat(spokes)
+                path.move(to: NSPoint(x: c.x + cos(a) * r * 0.30, y: c.y + sin(a) * r * 0.30))
+                path.line(to: NSPoint(x: c.x + cos(a) * r * 0.98, y: c.y + sin(a) * r * 0.98))
+            }
+            path.lineWidth = max(1, size * 0.11); path.lineCapStyle = .round; path.stroke()
+        case "gemini":                                    // four-pointed sparkle
+            let path = NSBezierPath()
+            let pts = [NSPoint(x: c.x, y: c.y + r), NSPoint(x: c.x + r, y: c.y),
+                       NSPoint(x: c.x, y: c.y - r), NSPoint(x: c.x - r, y: c.y)]
+            path.move(to: pts[0])
+            for i in 0..<4 {  // control points pulled off-centre so the arms read at 12 px
+                let next = pts[(i + 1) % 4]
+                let c1 = NSPoint(x: c.x + (pts[i].x - c.x) * 0.28, y: c.y + (pts[i].y - c.y) * 0.28)
+                let c2 = NSPoint(x: c.x + (next.x - c.x) * 0.28, y: c.y + (next.y - c.y) * 0.28)
+                path.curve(to: next, controlPoint1: c1, controlPoint2: c2)
+            }
+            path.close(); path.fill()
+        default:                                          // interlocking rosette
+            let path = NSBezierPath()
+            for i in 0..<3 {
+                let oval = NSBezierPath(ovalIn: NSRect(x: c.x - r * 0.42, y: c.y - r,
+                                                       width: r * 0.84, height: r * 2))
+                let t = NSAffineTransform()
+                t.translateX(by: c.x, yBy: c.y)
+                t.rotate(byDegrees: CGFloat(i) * 60)
+                t.translateX(by: -c.x, yBy: -c.y)
+                oval.transform(using: t as AffineTransform)
+                path.append(oval)
+            }
+            path.lineWidth = max(0.9, size * 0.075); path.stroke()
+        }
+        return true
+    }
+}
+
 func ring(_ p: Int, size: CGFloat = 14) -> NSImage {
     let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
         let c = NSPoint(x: rect.midX, y: rect.midY), r = rect.width / 2 - 1.5
@@ -52,17 +109,33 @@ final class Bar: NSView {
     }
 }
 
+final class SectionHeader: NSView {
+    init(title: String, group: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
+        let icon = NSImageView(frame: NSRect(x: 18, y: 6, width: 13, height: 13))
+        icon.image = vendorGlyph(group, size: 13)
+        let label = NSTextField(labelWithString: title.uppercased())
+        label.frame = NSRect(x: 37, y: 5, width: 260, height: 15)
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = vendorColor(group)
+        [icon, label].forEach(addSubview)
+    }
+    required init?(coder: NSCoder) { nil }
+}
+
 final class BarRow: NSView {
     init(_ g: Gauge) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 40))
-        let label = NSTextField(labelWithString: g.label)
-        label.frame = NSRect(x: 14, y: 21, width: 190, height: 16); label.font = .systemFont(ofSize: 12)
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 42))
+        let name = g.label.contains("·") ? String(g.label.split(separator: "·").last!).trimmingCharacters(in: .whitespaces) : g.label
+        let label = NSTextField(labelWithString: name)
+        label.frame = NSRect(x: 37, y: 22, width: 190, height: 16); label.font = .systemFont(ofSize: 12)
         let pct = NSTextField(labelWithString: "\(g.percent) %")
-        pct.frame = NSRect(x: 210, y: 21, width: 76, height: 16); pct.alignment = .right
+        pct.frame = NSRect(x: 230, y: 22, width: 72, height: 16); pct.alignment = .right
         pct.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold); pct.textColor = color(g.percent)
         let reset = NSTextField(labelWithString: resetText(g.reset))
-        reset.frame = NSRect(x: 14, y: 3, width: 272, height: 13); reset.font = .systemFont(ofSize: 10); reset.textColor = .secondaryLabelColor
-        let bar = Bar(frame: NSRect(x: 14, y: 16, width: 272, height: 5), percent: g.percent)
+        reset.frame = NSRect(x: 37, y: 4, width: 265, height: 13)
+        reset.font = .systemFont(ofSize: 10); reset.textColor = .tertiaryLabelColor
+        let bar = Bar(frame: NSRect(x: 37, y: 17, width: 265, height: 4), percent: g.percent)
         [label, pct, reset, bar].forEach(addSubview)
     }
     required init?(coder: NSCoder) { nil }
@@ -96,14 +169,14 @@ final class App: NSObject, NSApplicationDelegate {
     func render(_ payload: Payload?, _ extraErrors: [String]) {
         let gauges = payload?.gauges ?? []
         let title = NSMutableAttributedString()
-        let letterFont = NSFont.systemFont(ofSize: 10, weight: .semibold)
         let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         for id in headline {
             guard let g = gauges.first(where: { $0.id == id }) else { continue }
-            title.append(NSAttributedString(string: "\(g.short) ", attributes: [.font: letterFont, .foregroundColor: NSColor.secondaryLabelColor]))
-            let att = NSTextAttachment(); att.image = ring(g.percent); att.bounds = NSRect(x: 0, y: -3, width: 14, height: 14)
-            title.append(NSAttributedString(attachment: att))
-            title.append(NSAttributedString(string: " \(g.percent)%   ", attributes: [.font: numberFont]))
+            let mark = NSTextAttachment(); mark.image = vendorGlyph(g.group, size: 12)
+            mark.bounds = NSRect(x: 0, y: -2, width: 12, height: 12)
+            title.append(NSAttributedString(attachment: mark))
+            title.append(NSAttributedString(string: " \(g.percent)%   ",
+                                            attributes: [.font: numberFont, .foregroundColor: color(g.percent)]))
         }
         item.button?.attributedTitle = title.length > 0 ? title : NSAttributedString(string: "usage ?")
 
@@ -112,7 +185,8 @@ final class App: NSObject, NSApplicationDelegate {
         for g in gauges {
             if g.group != lastGroup {
                 if !lastGroup.isEmpty { menu.addItem(.separator()) }
-                let h = NSMenuItem(title: groupTitles[g.group] ?? g.group.uppercased(), action: nil, keyEquivalent: ""); h.isEnabled = false
+                let h = NSMenuItem(); h.isEnabled = false
+                h.view = SectionHeader(title: groupTitles[g.group] ?? g.group.uppercased(), group: g.group)
                 menu.addItem(h); lastGroup = g.group
             }
             let mi = NSMenuItem(); mi.view = BarRow(g); menu.addItem(mi)
