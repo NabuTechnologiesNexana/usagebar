@@ -7,10 +7,12 @@ weekly, weekly per-model), **Gemini / Antigravity** (`agy` CLI + IDE share one q
 `/usr/bin/python3`) + one Swift file compiled with `swiftc`.
 
 ```
-C ◔ 3%   F ◔ 32%   G ◔ 0%        ← menubar: letter + ring per headline gauge
+✳ 35%   ✦ 1%   ⚛ 10%        ← menubar: vendor mark + usage-coloured percentage
 ```
 
-Click for all gauges with progress bars and reset countdowns. A macOS notification
+Vendor marks are drawn as vectors in `UsageBar.swift` (no assets, no network) — simplified
+in-house renditions, not the official trademarked artwork. Click for all gauges grouped by
+vendor, with progress bars and reset countdowns. A macOS notification
 fires once per limit per reset window when it crosses 80 %.
 
 ## Install
@@ -46,6 +48,16 @@ a broken source shows as a `⚠` row in the menu, the others keep working.
 3. Nothing to configure: API-key logins (`OPENAI_API_KEY`) have no rate-limit windows and are
    skipped on purpose.
 
+On a Plus plan, pin a cheaper default in `~/.codex/config.toml` (`model = "gpt-5.6-terra"`) —
+with an empty config Codex runs the flagship `gpt-5.6-sol` on everything and the 5 h window
+drains fast.
+
+## Notes for other machines
+
+Binaries are resolved by `find_binary()`, not by `PATH`: launchd starts the app with a minimal
+`PATH`, so a Homebrew `codex` or a `~/.local/bin/agy` is invisible to `shutil.which` and the
+matching section silently disappears from the menu. Add any unusual install dir there.
+
 ## Before you publish or fork this
 
 None of the endpoints here are documented or supported by their vendors. The tool
@@ -62,6 +74,7 @@ menu. Use it as a personal convenience, not as something to build a product on.
 | Threshold for notifications | `NOTIFY_AT` in `usage.py` (or env `USAGEBAR_NOTIFY_AT`) |
 | Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
 | Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
+| Vendor marks and colours | `vendorGlyph()` / `vendorColor()` in `UsageBar.swift` |
 | Refresh interval | `refreshSeconds` in `UsageBar.swift` |
 | Colors | `color()` in `UsageBar.swift` (green < 50, orange < 80, red ≥ 80) |
 
