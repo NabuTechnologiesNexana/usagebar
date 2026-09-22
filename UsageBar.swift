@@ -1,5 +1,5 @@
 // Zero-dependency macOS menubar app. Runs usage.py every 5 minutes and renders its JSON:
-// menubar = vendor mark + the fullest window per vendor, menu = where to switch next + progress bar per gauge.
+// menubar = vendor mark + current 5 h usage per vendor, menu = where to switch next + progress bar per gauge.
 // Build: swiftc -O -o UsageBar UsageBar.swift   (see install.sh)
 import Cocoa
 
@@ -15,6 +15,7 @@ let scriptPath = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("usage.py").path
 let groupOrder = ["claude", "gemini", "codex"]
+let headline = ["claude:session", "antigravity:gemini-5h", "codex:primary_window"]  // menubar = the current 5 h windows
 let refreshSeconds: TimeInterval = 300
 let groupTitles = ["claude": "CLAUDE", "gemini": "GEMINI (Antigravity)", "codex": "CODEX"]
 let groupNames = ["claude": "Claude", "gemini": "Gemini", "codex": "Codex"]
@@ -249,19 +250,15 @@ final class App: NSObject, NSApplicationDelegate {
         let ranked = groupOrder.map { ($0, limiting(gauges, $0)) }
             .sorted { a, b in (a.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) > (b.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) }
 
-        // Menubar: per vendor the limiting window, "7d" flagged when it is the weekly one.
         let title = NSMutableAttributedString()
         let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        let smallFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
-        for group in groupOrder {
-            guard let g = limiting(gauges, group) else { continue }
-            let mark = NSTextAttachment(); mark.image = vendorGlyph(group, size: 12, tint: g.isStale ? .tertiaryLabelColor : nil)
+        for id in headline {
+            guard let g = gauges.first(where: { $0.id == id }) else { continue }
+            let mark = NSTextAttachment(); mark.image = vendorGlyph(g.group, size: 12, tint: g.isStale ? .tertiaryLabelColor : nil)
             mark.bounds = NSRect(x: 0, y: -2, width: 12, height: 12)
             title.append(NSAttributedString(attachment: mark))
             let tint: NSColor = g.isStale ? .tertiaryLabelColor : color(g.percent)
-            title.append(NSAttributedString(string: " \(g.percent)%", attributes: [.font: numberFont, .foregroundColor: tint]))
-            if g.window.hasPrefix("týždeň") { title.append(NSAttributedString(string: " 7d", attributes: [.font: smallFont, .foregroundColor: tint, .baselineOffset: 1])) }
-            title.append(NSAttributedString(string: "   ", attributes: [.font: numberFont]))
+            title.append(NSAttributedString(string: " \(g.percent)%   ", attributes: [.font: numberFont, .foregroundColor: tint]))
         }
         item.button?.attributedTitle = title.length > 0 ? title : NSAttributedString(string: "usage ?")
 

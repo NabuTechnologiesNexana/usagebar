@@ -7,7 +7,7 @@ weekly, weekly per-model), **Gemini / Antigravity** (`agy` CLI + IDE share one q
 `/usr/bin/python3`) + one Swift file compiled with `swiftc`.
 
 ```
-✳ 59% 7d   ✦ 22% 7d   ⚛ 6%     ← menubar: vendor mark + the fullest window per vendor ("7d" = the weekly one)
+✳ 29%   ✦ 0%   ⚛ 6%        ← menubar: vendor mark + current 5 h usage per vendor
 ```
 
 Click for **Kam prepnúť teraz** (vendors ranked by headroom, with the limiting window and its
@@ -77,7 +77,8 @@ section turns grey and shows why. Use it as a personal convenience, not as somet
 |---|---|
 | Threshold for notifications | `NOTIFY_AT` in `usage.py` (or env `USAGEBAR_NOTIFY_AT`) |
 | Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
-| Which gauge represents a vendor in the menubar | `limiting()` in `UsageBar.swift` (the fullest window; for Antigravity only the Gemini group) |
+| Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
+| Which window ranks a vendor in "Kam prepnúť teraz" | `limiting()` in `UsageBar.swift` (the fullest window; for Antigravity only the Gemini group) |
 | Vendor marks and colours | `icons/*.svg`, `vendorGlyph()` / `vendorColor()` in `UsageBar.swift` |
 | agy timeout / cache | `ANTIGRAVITY_TIMEOUT`, `ANTIGRAVITY_CACHE_TTL` in `usage.py` |
 | Refresh interval | `refreshSeconds` in `UsageBar.swift` |
