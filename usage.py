@@ -34,6 +34,9 @@ STATE_DIR = Path(os.environ.get("USAGEBAR_STATE", Path.home() / "Library/Applica
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
 GEMINI_TOKEN_CACHE = STATE_DIR / "gemini_token.json"
+ANTIGRAVITY_CACHE = STATE_DIR / "antigravity_cache.json"
+ANTIGRAVITY_CSRF_CACHE = STATE_DIR / "antigravity_csrf.json"
+ANTIGRAVITY_CACHE_TTL = 120
 CODEX_AUTH = Path.home() / ".codex/auth.json"
 
 
@@ -110,7 +113,7 @@ def claude_gauges() -> list[dict]:
 #    the Antigravity client, the way CodexBar does it).
 
 ANTIGRAVITY_RPC = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-ANTIGRAVITY_GROUPS = {"Gemini Models": "Gemini", "Claude and GPT models": "Antigravity Claude/GPT"}
+ANTIGRAVITY_GROUPS = {"Gemini Models": "Gemini", "Claude and GPT models": "Other models"}
 
 
 def antigravity_local_ports() -> list[int]:
@@ -128,15 +131,81 @@ def antigravity_local_ports() -> list[int]:
 
 
 def antigravity_local_summary() -> dict | None:
-    for port in antigravity_local_ports():
+    csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+    if csrf:
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            ANTIGRAVITY_CSRF_CACHE.write_text(json.dumps({"csrf": csrf}))
+            ANTIGRAVITY_CSRF_CACHE.chmod(0o600)
+        except Exception:
+            pass
+    elif ANTIGRAVITY_CSRF_CACHE.exists():
+        try:
+            csrf = json.loads(ANTIGRAVITY_CSRF_CACHE.read_text()).get("csrf")
+        except Exception:
+            csrf = None
+
+    headers = {"Content-Type": "application/json"}
+    if csrf:
+        headers["x-codeium-csrf-token"] = csrf
+
+    ports = antigravity_local_ports()
+    ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+    if ls_addr and ":" in ls_addr:
+        try:
+            p = int(ls_addr.rsplit(":", 1)[1])
+            if p not in ports:
+                ports.insert(0, p)
+        except ValueError:
+            pass
+
+    for port in ports:
         for scheme in ("http", "https"):
             try:
                 req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}{ANTIGRAVITY_RPC}", data=b"{}",
-                                             headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=3, context=ssl._create_unverified_context()) as r:
-                    return json.load(r)["response"]
+                                             headers=headers)
+                with urllib.request.urlopen(req, timeout=2, context=ssl._create_unverified_context()) as r:
+                    data = json.load(r)
+                    if "response" in data:
+                        return data["response"]
             except Exception:
                 continue
+    return None
+
+
+def antigravity_cli_summary() -> dict | None:
+    """Use `agy -p /usage --output-format json` (supported in agy 1.1.11+).
+    Works reliably even when the local server enforces CSRF tokens. Cached for ANTIGRAVITY_CACHE_TTL seconds."""
+    now = datetime.now(timezone.utc).timestamp()
+    if ANTIGRAVITY_CACHE.exists():
+        try:
+            cached = json.loads(ANTIGRAVITY_CACHE.read_text())
+            if now - cached.get("timestamp", 0) < ANTIGRAVITY_CACHE_TTL:
+                return cached.get("data")
+        except Exception:
+            pass
+
+    agy = find_binary("agy")
+    if not agy:
+        return None
+
+    try:
+        r = subprocess.run([agy, "-p", "/usage", "--output-format", "json"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        data = json.loads(r.stdout)
+        summary = data.get("command", {}).get("data")
+        if summary and "groups" in summary:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                ANTIGRAVITY_CACHE.write_text(json.dumps({"timestamp": now, "data": summary}))
+                ANTIGRAVITY_CACHE.chmod(0o600)
+            except Exception:
+                pass
+            return summary
+    except Exception:
+        return None
     return None
 
 
@@ -191,16 +260,20 @@ def antigravity_cloud_summary() -> dict | None:
 
 
 def gemini_gauges() -> list[dict]:
-    summary = antigravity_local_summary() or antigravity_cloud_summary()
+    summary = antigravity_local_summary() or antigravity_cli_summary() or antigravity_cloud_summary()
     if not summary:
         return []
     out = []
-    for group in summary["groups"]:
-        name = ANTIGRAVITY_GROUPS.get(group["displayName"], group["displayName"])
-        for b in sorted(group["buckets"], key=lambda b: b.get("window") != "5h"):  # 5h row first
+    for group in summary.get("groups", []):
+        group_name = group.get("displayName") or group.get("name") or ""
+        name = ANTIGRAVITY_GROUPS.get(group_name, group_name)
+        for b in sorted(group.get("buckets", []), key=lambda b: b.get("window") != "5h"):  # 5h row first
             window = "5 h" if b.get("window") == "5h" else "týždeň"
-            out.append(gauge(f"antigravity:{b['bucketId']}", "G" if name == "Gemini" else "A", f"{name} · {window}",
-                             (1 - b.get("remainingFraction", 1)) * 100, b.get("resetTime"), "gemini"))
+            bid = b.get("bucketId") or b.get("id") or ""
+            rem = b.get("remainingFraction") if "remainingFraction" in b else b.get("remaining_fraction", 1)
+            reset = b.get("resetTime") or b.get("reset_time")
+            out.append(gauge(f"antigravity:{bid}", "G" if name == "Gemini" else "A", f"{name} · {window}",
+                             (1 - rem) * 100, reset, "gemini"))
     return out
 
 

@@ -126,7 +126,12 @@ final class SectionHeader: NSView {
 final class BarRow: NSView {
     init(_ g: Gauge) {
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 42))
-        let name = g.label.contains("·") ? String(g.label.split(separator: "·").last!).trimmingCharacters(in: .whitespaces) : g.label
+        let name: String
+        if g.label.hasPrefix("Gemini · ") || g.label.hasPrefix("Claude · ") || g.label.hasPrefix("Codex · ") {
+            name = String(g.label.split(separator: "·").last!).trimmingCharacters(in: .whitespaces)
+        } else {
+            name = g.label
+        }
         let label = NSTextField(labelWithString: name)
         label.frame = NSRect(x: 37, y: 22, width: 190, height: 16); label.font = .systemFont(ofSize: 12)
         let pct = NSTextField(labelWithString: "\(g.percent) %")
