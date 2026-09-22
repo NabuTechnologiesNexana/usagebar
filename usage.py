@@ -7,25 +7,24 @@ Sources (each is skipped silently when its credentials are not on this Mac):
   claude  - the endpoint Claude Code's /usage uses. OAuth token from the Keychain,
             sent only to api.anthropic.com. 5h session, weekly all-models, weekly per-model.
   gemini  - Antigravity quota summary (5h + weekly per model group, shared by the `agy`
-            CLI and the IDE). Read from a running agy/Antigravity language server on
-            localhost when there is one, else from the Cloud Code API with agy's Keychain
-            token (refreshed with agy's own OAuth client, read from the agy binary).
+            CLI and the IDE): `agy -p /usage --output-format json`, cached briefly. A running
+            language server on localhost is tried first when a CSRF token is provided.
   codex   - OpenAI Codex CLI rate limits (ChatGPT login) from ~/.codex/auth.json, via the
-            endpoint CodexBar uses. Not yet exercised against a live account.
+            endpoint CodexBar uses.
 
+When a source fails, its last good gauges are re-emitted with "stale": true (plus the error),
+so the bar keeps showing real numbers instead of dropping the section or inventing 0 %.
 Sends one macOS notification per limit per reset window when it crosses NOTIFY_AT.
 Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatible.
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
 import shutil
 import ssl
 import subprocess
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,10 +32,10 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("USAGEBAR_STATE", Path.home() / "Library/Application Support/UsageBar"))
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
-GEMINI_TOKEN_CACHE = STATE_DIR / "gemini_token.json"
+LAST_OK_FILE = STATE_DIR / "last_ok.json"
 ANTIGRAVITY_CACHE = STATE_DIR / "antigravity_cache.json"
-ANTIGRAVITY_CSRF_CACHE = STATE_DIR / "antigravity_csrf.json"
-ANTIGRAVITY_CACHE_TTL = 120
+ANTIGRAVITY_CACHE_TTL = 120  # a manual "Obnoviť" right after the timer should not spawn agy again
+ANTIGRAVITY_TIMEOUT = 40  # agy -p /usage takes 4-6 s warm, ~15 s cold
 CODEX_AUTH = Path.home() / ".codex/auth.json"
 
 
@@ -76,8 +75,22 @@ def http_json(url: str, headers: dict, body: bytes | None = None) -> dict:
         return json.load(r)
 
 
+def write_private(path: Path, payload: dict) -> None:
+    """0600 from the first byte (chmod after write_text leaves a window with default perms)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def gauge(id_: str, short: str, label: str, percent: float, reset: str | None, group: str) -> dict:
-    return {"id": id_, "short": short, "label": label, "percent": int(round(percent)), "reset": reset, "group": group}
+    return {"id": id_, "short": short, "label": label, "percent": int(round(percent)), "reset": reset, "group": group,
+            "fetched_at": now_iso(), "stale": False}
 
 
 # --- Claude ------------------------------------------------------------------
@@ -101,19 +114,22 @@ def claude_gauges() -> list[dict]:
             short, label = model[:1], f"Claude · týždeň {model}"
         else:
             continue
-        out.append(gauge(f"claude:{kind}", short, label, lim["percent"], lim["resets_at"], "claude"))
+        id_ = f"claude:{kind}:{model}" if kind == "weekly_scoped" else f"claude:{kind}"  # scoped gauges must not share a notification key
+        out.append(gauge(id_, short, label, lim["percent"], lim["resets_at"], "claude"))
     return out
 
 
 # --- Gemini / Antigravity ----------------------------------------------------
 # Same data the Antigravity IDE shows: per model-group 5h + weekly windows.
-# 1. Any running agy / Antigravity language server answers on localhost without
-#    auth - preferred, nothing leaves the machine.
-# 2. Otherwise the Cloud Code summary endpoint with agy's token (identifying as
-#    the Antigravity client, the way CodexBar does it).
+# 1. A running agy / Antigravity language server on localhost, if ANTIGRAVITY_CSRF_TOKEN
+#    is set (agy 1.2+ rejects RPCs without the x-codeium-csrf-token header). Off by default.
+# 2. `agy -p /usage --output-format json` (agy 1.1.11+). Authoritative, 4-15 s.
+# The Cloud Code endpoint (cloudcode-pa.googleapis.com retrieveUserQuotaSummary) is NOT
+# used any more: it answers with remainingFraction 1 for every bucket, i.e. a fake 0 %.
 
 ANTIGRAVITY_RPC = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
 ANTIGRAVITY_GROUPS = {"Gemini Models": "Gemini", "Claude and GPT models": "Other models"}
+ANTIGRAVITY_WINDOWS = {"5h": "5 h", "weekly": "týždeň"}
 
 
 def antigravity_local_ports() -> list[int]:
@@ -132,148 +148,81 @@ def antigravity_local_ports() -> list[int]:
 
 def antigravity_local_summary() -> dict | None:
     csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
-    if csrf:
-        try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            ANTIGRAVITY_CSRF_CACHE.write_text(json.dumps({"csrf": csrf}))
-            ANTIGRAVITY_CSRF_CACHE.chmod(0o600)
-        except Exception:
-            pass
-    elif ANTIGRAVITY_CSRF_CACHE.exists():
-        try:
-            csrf = json.loads(ANTIGRAVITY_CSRF_CACHE.read_text()).get("csrf")
-        except Exception:
-            csrf = None
-
-    headers = {"Content-Type": "application/json"}
-    if csrf:
-        headers["x-codeium-csrf-token"] = csrf
-
-    ports = antigravity_local_ports()
-    ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
-    if ls_addr and ":" in ls_addr:
-        try:
-            p = int(ls_addr.rsplit(":", 1)[1])
-            if p not in ports:
-                ports.insert(0, p)
-        except ValueError:
-            pass
-
-    for port in ports:
+    if not csrf:
+        return None
+    headers = {"Content-Type": "application/json", "x-codeium-csrf-token": csrf}
+    for port in antigravity_local_ports():
         for scheme in ("http", "https"):
             try:
-                req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}{ANTIGRAVITY_RPC}", data=b"{}",
-                                             headers=headers)
+                req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}{ANTIGRAVITY_RPC}", data=b"{}", headers=headers)
                 with urllib.request.urlopen(req, timeout=2, context=ssl._create_unverified_context()) as r:
                     data = json.load(r)
-                    if "response" in data:
-                        return data["response"]
+                if "response" in data:
+                    return data["response"]
             except Exception:
                 continue
     return None
 
 
-def antigravity_cli_summary() -> dict | None:
-    """Use `agy -p /usage --output-format json` (supported in agy 1.1.11+).
-    Works reliably even when the local server enforces CSRF tokens. Cached for ANTIGRAVITY_CACHE_TTL seconds."""
+def antigravity_cli_summary() -> dict:
     now = datetime.now(timezone.utc).timestamp()
     if ANTIGRAVITY_CACHE.exists():
         try:
             cached = json.loads(ANTIGRAVITY_CACHE.read_text())
             if now - cached.get("timestamp", 0) < ANTIGRAVITY_CACHE_TTL:
-                return cached.get("data")
+                return cached["data"]
         except Exception:
             pass
-
     agy = find_binary("agy")
     if not agy:
-        return None
-
+        raise RuntimeError("agy nie je nainštalované")
     try:
         r = subprocess.run([agy, "-p", "/usage", "--output-format", "json"],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode != 0 or not r.stdout.strip():
-            return None
-        data = json.loads(r.stdout)
-        summary = data.get("command", {}).get("data")
-        if summary and "groups" in summary:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                ANTIGRAVITY_CACHE.write_text(json.dumps({"timestamp": now, "data": summary}))
-                ANTIGRAVITY_CACHE.chmod(0o600)
-            except Exception:
-                pass
-            return summary
+                           capture_output=True, text=True, timeout=ANTIGRAVITY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"agy neodpovedalo do {ANTIGRAVITY_TIMEOUT} s")
+    if r.returncode != 0:
+        raise RuntimeError(f"agy skončilo s kódom {r.returncode}: {(r.stderr or r.stdout).strip()[:60]}")
+    summary = json.loads(r.stdout).get("command", {}).get("data")
+    antigravity_buckets(summary)  # validate before caching, so a broken shape is never served from cache
+    try:
+        write_private(ANTIGRAVITY_CACHE, {"timestamp": datetime.now(timezone.utc).timestamp(), "data": summary})
     except Exception:
-        return None
-    return None
+        pass  # cache is an optimisation, never a reason to lose a good sample
+    return summary
 
 
-def gemini_oauth_clients() -> list[tuple[str, str]]:
-    """OAuth client id/secret pairs embedded in the agy binary (public desktop-app credentials)."""
-    agy = find_binary("agy")
-    if not agy:
-        return []
-    blob = Path(agy).read_bytes()
-    ids = sorted(set(re.findall(rb"[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com", blob)))
-    secrets = sorted(set(re.findall(rb"GOCSPX-[A-Za-z0-9_-]{28}", blob)))
-    return [(i.decode(), s.decode()) for i in ids for s in secrets]
-
-
-def gemini_token() -> str | None:
-    raw = keychain("gemini", "antigravity")
-    if not raw:
-        return None
-    stored = json.loads(base64.b64decode(raw[len("go-keyring-base64:"):] if raw.startswith("go-keyring-base64:") else raw))["token"]
-    now = datetime.now(timezone.utc)
-    cached = json.loads(GEMINI_TOKEN_CACHE.read_text()) if GEMINI_TOKEN_CACHE.exists() else {}
-    for tok in (cached, stored):
-        if tok.get("expiry") and parse_iso(tok["expiry"]) - now > timedelta(minutes=2):
-            return tok["access_token"]
-    pairs = gemini_oauth_clients()
-    if cached.get("client"):
-        pairs.sort(key=lambda p: p != tuple(cached["client"]))  # try the pair that worked last time first
-    for client_id, client_secret in pairs:
-        form = urllib.parse.urlencode({"client_id": client_id, "client_secret": client_secret,
-                                       "refresh_token": stored["refresh_token"], "grant_type": "refresh_token"}).encode()
-        try:
-            fresh = http_json("https://oauth2.googleapis.com/token", {"Content-Type": "application/x-www-form-urlencoded"}, form)
-        except urllib.error.HTTPError:
-            continue
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        GEMINI_TOKEN_CACHE.write_text(json.dumps({
-            "access_token": fresh["access_token"],
-            "expiry": (now + timedelta(seconds=fresh["expires_in"])).isoformat(),
-            "client": [client_id, client_secret],
-        }))
-        GEMINI_TOKEN_CACHE.chmod(0o600)
-        return fresh["access_token"]
-    raise RuntimeError("Gemini token expired and refresh failed - run `agy` once to log in again")
-
-
-def antigravity_cloud_summary() -> dict | None:
-    token = gemini_token()
-    if not token:
-        return None
-    return http_json("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-                     {"Authorization": f"Bearer {token}", "User-Agent": "antigravity"}, b"{}")
+def antigravity_buckets(summary: dict | None) -> list[tuple[str, str, str, float, str | None]]:
+    """(group name, bucket id, window key, remaining fraction, reset) - raises on anything unexpected,
+    so a renamed field surfaces as a ⚠ row instead of a silent 0 %."""
+    groups = (summary or {}).get("groups")
+    if not groups:
+        raise ValueError("odpoveď bez groups")
+    out = []
+    for group in groups:
+        name = ANTIGRAVITY_GROUPS.get(group.get("displayName") or group.get("name") or "", None)
+        if name is None:
+            raise ValueError(f"neznáma skupina {group.get('displayName') or group.get('name')!r}")
+        buckets = group.get("buckets")
+        if not buckets:
+            raise ValueError(f"skupina {name} bez buckets")
+        for b in buckets:
+            bid = b.get("bucketId") or b.get("id")
+            rem = b.get("remainingFraction", b.get("remaining_fraction"))
+            window = b.get("window")
+            if not bid or not isinstance(rem, (int, float)) or not 0 <= rem <= 1 or window not in ANTIGRAVITY_WINDOWS:
+                raise ValueError(f"neplatný bucket {bid!r}: rem={rem!r} window={window!r}")
+            out.append((name, bid, window, float(rem), b.get("resetTime") or b.get("reset_time")))
+    return out
 
 
 def gemini_gauges() -> list[dict]:
-    summary = antigravity_local_summary() or antigravity_cli_summary() or antigravity_cloud_summary()
-    if not summary:
-        return []
+    summary = antigravity_local_summary() or antigravity_cli_summary()
     out = []
-    for group in summary.get("groups", []):
-        group_name = group.get("displayName") or group.get("name") or ""
-        name = ANTIGRAVITY_GROUPS.get(group_name, group_name)
-        for b in sorted(group.get("buckets", []), key=lambda b: b.get("window") != "5h"):  # 5h row first
-            window = "5 h" if b.get("window") == "5h" else "týždeň"
-            bid = b.get("bucketId") or b.get("id") or ""
-            rem = b.get("remainingFraction") if "remainingFraction" in b else b.get("remaining_fraction", 1)
-            reset = b.get("resetTime") or b.get("reset_time")
-            out.append(gauge(f"antigravity:{bid}", "G" if name == "Gemini" else "A", f"{name} · {window}",
-                             (1 - rem) * 100, reset, "gemini"))
+    rows = sorted(antigravity_buckets(summary), key=lambda t: (t[0] != "Gemini", t[2] != "5h"))  # Gemini group first, 5h first
+    for name, bid, window, rem, reset in rows:
+        out.append(gauge(f"antigravity:{bid}", "G" if name == "Gemini" else "A", f"{name} · {ANTIGRAVITY_WINDOWS[window]}",
+                         (1 - rem) * 100, reset, "gemini"))
     return out
 
 
@@ -295,17 +244,25 @@ def codex_gauges() -> list[dict]:
     req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
     with urllib.request.urlopen(req, timeout=20) as r:
         data = json.load(r)
+    rate = data.get("rate_limit")
+    if not isinstance(rate, dict):
+        raise RuntimeError("odpoveď bez rate_limit (zmenilo sa API?)")
     out = []
     for key in ("primary_window", "secondary_window"):
-        win = (data.get("rate_limit") or {}).get(key)
+        win = rate.get(key)
         if not win:
             continue
+        used = win.get("used_percent")
+        if not isinstance(used, (int, float)):
+            raise RuntimeError(f"{key} bez used_percent")
         seconds = win.get("limit_window_seconds") or 0
         window = f"{round(seconds / 3600)} h" if seconds and seconds < 48 * 3600 else "týždeň"
         reset = win.get("reset_at")
         if isinstance(reset, (int, float)):
             reset = datetime.fromtimestamp(reset, timezone.utc).isoformat()
-        out.append(gauge(f"codex:{key}", "X", f"Codex · {window}", win.get("used_percent", 0), reset, "codex"))
+        out.append(gauge(f"codex:{key}", "X", f"Codex · {window}", used, reset, "codex"))
+    if not out:
+        raise RuntimeError("rate_limit bez okien (účet bez limitov?)")
     return out
 
 
@@ -329,13 +286,29 @@ SOURCES = [claude_gauges, gemini_gauges, codex_gauges]
 
 def main() -> None:
     gauges, errors = [], []
-    for source in SOURCES:
-        try:
-            gauges += source()
-        except Exception as e:  # keep the bar alive; surface the reason in the menu
-            errors.append(f"{source.__name__.split('_')[0]}: {type(e).__name__}: {str(e)[:80]}")
     try:
-        notify(gauges)
+        last_ok = json.loads(LAST_OK_FILE.read_text()) if LAST_OK_FILE.exists() else {}
+    except Exception:
+        last_ok = {}
+    for source in SOURCES:
+        name = source.__name__.split("_")[0]
+        try:
+            fresh = source()
+            gauges += fresh
+            if fresh:
+                last_ok[name] = fresh
+            else:
+                last_ok.pop(name, None)  # source deliberately absent (no login) - forget it
+        except Exception as e:  # keep the bar alive: last good numbers greyed out + the reason in the menu
+            why = str(e)[:80] if isinstance(e, (RuntimeError, ValueError)) else f"{type(e).__name__}: {str(e)[:70]}"
+            errors.append(f"{name}: {why}")
+            gauges += [{**g, "stale": True} for g in last_ok.get(name, [])]
+    try:
+        write_private(LAST_OK_FILE, last_ok)
+    except Exception:
+        pass
+    try:
+        notify([g for g in gauges if not g["stale"]])
     except Exception as e:
         errors.append(f"notify: {e}")
     print(json.dumps({"gauges": gauges, "errors": errors}, ensure_ascii=False))
