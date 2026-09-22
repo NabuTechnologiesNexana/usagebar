@@ -7,13 +7,18 @@ weekly, weekly per-model), **Gemini / Antigravity** (`agy` CLI + IDE share one q
 `/usr/bin/python3`) + one Swift file compiled with `swiftc`.
 
 ```
-✳ 35%   ✦ 1%   ⚛ 10%        ← menubar: vendor mark + usage-coloured percentage
+✳ 59% 7d   ✦ 22% 7d   ⚛ 6%     ← menubar: vendor mark + the fullest window per vendor ("7d" = the weekly one)
 ```
 
-Vendor marks are drawn as vectors in `UsageBar.swift` (no assets, no network) — simplified
-in-house renditions, not the official trademarked artwork. Click for all gauges grouped by
-vendor, with progress bars and reset countdowns. A macOS notification
-fires once per limit per reset window when it crosses 80 %.
+Click for **Kam prepnúť teraz** (vendors ranked by headroom, with the limiting window and its
+reset) and all gauges grouped by vendor, with progress bars and reset countdowns. When a source
+fails, its last good numbers stay in the menu greyed out with "zastarané · pred N min" and the
+reason as a ⚠ row; nothing is invented. A macOS notification fires once per limit per reset
+window when it crosses 80 %.
+
+Vendor marks are the logo shapes from [Simple Icons](https://simpleicons.org) in `icons/`
+(CC0 collection; the marks remain their owners' trademarks), tinted per vendor. Without the
+files the app falls back to in-house vector renditions drawn in `UsageBar.swift`.
 
 ## Install
 
@@ -31,13 +36,14 @@ Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 | Source | Credentials (read only, never stored by this tool) | Endpoint |
 |---|---|---|
 | Claude | Keychain item `Claude Code-credentials` (written by Claude Code login) | `api.anthropic.com/api/oauth/usage` — same as `/usage` in Claude Code |
-| Gemini / Antigravity | none when an `agy` / Antigravity language server is running (localhost RPC, no auth); otherwise Keychain item `gemini` / `antigravity` (written by `agy` login), refresh via the OAuth client embedded in the `agy` binary | local `RetrieveUserQuotaSummary`, else `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` — the same 5 h + weekly per-group numbers the IDE shows |
-| Codex | `~/.codex/auth.json` (only when the `codex` CLI is installed and logged in via ChatGPT) | `chatgpt.com/backend-api/wham/usage` — same call CodexBar makes; shape verified against its source, not yet run against a live account |
+| Gemini / Antigravity | the `agy` login itself: `agy -p /usage --output-format json` (agy 1.1.11+), cached 120 s | agy's own quota command — the same 5 h + weekly per-group numbers the IDE shows. A running language server is asked first only when `ANTIGRAVITY_CSRF_TOKEN` is set (agy 1.2+ rejects the localhost RPC without it). The Cloud Code endpoint is deliberately not used: it answers "100 % remaining" for everything |
+| Codex | `~/.codex/auth.json` (only when the `codex` CLI is installed and logged in via ChatGPT) | `chatgpt.com/backend-api/wham/usage` — same call CodexBar makes |
 
-Tokens are sent only to their own vendor's API. A refreshed Gemini access token is
-cached in `~/Library/Application Support/UsageBar/` (mode 600). Nothing else leaves
-the machine. All endpoints are internal/undocumented and may change without notice —
-a broken source shows as a `⚠` row in the menu, the others keep working.
+Tokens are sent only to their own vendor's API. `~/Library/Application Support/UsageBar/`
+(mode 600) holds the agy quota cache and the last good gauges per source. Nothing else leaves
+the machine. All endpoints are internal/undocumented and may change without notice — an
+unexpected response shape is reported as a `⚠` row (never rendered as 0 %), the last good
+numbers stay greyed out, the other sources keep working.
 
 ## Hooking up Codex
 
@@ -62,10 +68,8 @@ matching section silently disappears from the menu. Add any unusual install dir 
 
 None of the endpoints here are documented or supported by their vendors. The tool
 reads **your own** limits with **your own** login, read-only, and sends each token
-only to that vendor's API. The Gemini source identifies itself as the installed
-`agy` client (that is what the quota endpoint expects); if Google or Anthropic
-change or close these endpoints the corresponding rows simply disappear from the
-menu. Use it as a personal convenience, not as something to build a product on.
+only to that vendor's API. If Google, OpenAI or Anthropic change or close these endpoints the corresponding
+section turns grey and shows why. Use it as a personal convenience, not as something to build a product on.
 
 ## Tweaks
 
@@ -73,8 +77,9 @@ menu. Use it as a personal convenience, not as something to build a product on.
 |---|---|
 | Threshold for notifications | `NOTIFY_AT` in `usage.py` (or env `USAGEBAR_NOTIFY_AT`) |
 | Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
-| Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
-| Vendor marks and colours | `vendorGlyph()` / `vendorColor()` in `UsageBar.swift` |
+| Which gauge represents a vendor in the menubar | `limiting()` in `UsageBar.swift` (the fullest window; for Antigravity only the Gemini group) |
+| Vendor marks and colours | `icons/*.svg`, `vendorGlyph()` / `vendorColor()` in `UsageBar.swift` |
+| agy timeout / cache | `ANTIGRAVITY_TIMEOUT`, `ANTIGRAVITY_CACHE_TTL` in `usage.py` |
 | Refresh interval | `refreshSeconds` in `UsageBar.swift` |
 | Colors | `color()` in `UsageBar.swift` (green < 50, orange < 80, red ≥ 80) |
 
