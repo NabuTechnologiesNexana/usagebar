@@ -26,4 +26,8 @@ PLIST
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -x UsageBar 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
+
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$DIR/usage.py" "$HOME/.local/bin/usagebar"
 echo "UsageBar installed: $PLIST"
+echo "CLI: $HOME/.local/bin/usagebar"

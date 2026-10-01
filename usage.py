@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Usage collector for UsageBar. Prints one JSON object to stdout:
+"""Usage collector for UsageBar.
+
+The menubar runs `python3 usage.py` with no arguments. That prints one JSON object:
 
     {"gauges": [{"id", "short", "label", "percent", "reset", "group"}], "errors": [...]}
+
+Invoked as `usagebar`, it prints every window for every signed-in account.
+`usagebar antigravity|grok|codex|claude` prints that account. A sample newer
+than the menu-bar refresh is reused, so the command does not wait on the network
+for numbers the menu already has. This path does not post the macOS notification.
 
 Sources (each is skipped silently when its credentials are not on this Mac):
   claude  - the endpoint Claude Code's /usage uses. OAuth token from the Keychain,
@@ -23,14 +30,17 @@ Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatib
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import shutil
 import ssl
 import subprocess
+import sys
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -553,32 +563,119 @@ def notify(gauges: list[dict]) -> None:
     NOTIFIED_FILE.write_text(json.dumps({k: v for k, v in seen.items() if k.split("@", 1)[1] > now_key}))
 
 
-SOURCES = [claude_gauges, gemini_gauges, codex_gauges, grok_gauges]
+# Internal keys match the gauge "group" and the last_ok file. The CLI says
+# "antigravity" for the gemini group, which is the name typed on the command line.
+SOURCE_FUNCS = {
+    "claude": claude_gauges,
+    "gemini": gemini_gauges,
+    "codex": codex_gauges,
+    "grok": grok_gauges,
+}
+CLI_SOURCES = {
+    "claude": "claude",
+    "codex": "codex",
+    "grok": "grok",
+    "antigravity": "gemini",
+    "gemini": "gemini",
+    "agy": "gemini",
+}
+SOURCE_NAME = {
+    "claude": "claude",
+    "gemini": "antigravity",
+    "codex": "codex",
+    "grok": "grok",
+}
+_WINDOW_WORDS = (("týždeň", "week"), ("mesiac", "month"), ("5 h", "5h"))
 
 
-def main() -> None:
-    gauges, errors = [], []
+CLI_MAX_AGE = 300  # the menu refreshes on this cadence; reuse a sample that young
+
+
+def _source_error(exc: Exception) -> str:
+    return str(exc)[:80] if isinstance(exc, (RuntimeError, ValueError)) else f"{type(exc).__name__}: {str(exc)[:70]}"
+
+
+def _sample_age(gauges: list[dict]) -> float | None:
+    now = datetime.now(timezone.utc)
+    ages = []
+    for g in gauges:
+        raw = g.get("fetched_at")
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            ages.append((now - parse_iso(raw)).total_seconds())
+        except Exception:
+            return None
+    return max(ages) if ages else None
+
+
+def _fetch_one(name: str) -> tuple[str, list[dict] | None, str | None]:
+    try:
+        return name, SOURCE_FUNCS[name](), None
+    except Exception as exc:
+        return name, None, _source_error(exc)
+
+
+def _fetch(names: list[str], last_ok: dict, parallel: bool) -> tuple[list[dict], list[str]]:
+    if parallel and len(names) > 1:
+        with ThreadPoolExecutor(max_workers=len(names)) as pool:
+            results = list(pool.map(_fetch_one, names))
+    else:
+        results = [_fetch_one(name) for name in names]
+    by_name = {name: (fresh, err) for name, fresh, err in results}
+    gauges: list[dict] = []
+    errors: list[str] = []
+    for name in names:
+        fresh, err = by_name[name]
+        if err is not None:
+            errors.append(f"{name}: {err}")
+            gauges += [{**g, "stale": True} for g in last_ok.get(name, [])]
+            continue
+        fresh = fresh or []
+        if fresh:
+            last_ok[name] = fresh
+        else:
+            last_ok.pop(name, None)  # source deliberately absent (no login) - forget it
+        gauges += fresh
+    return gauges, errors
+
+
+def collect(which: list[str] | None = None, max_age: float | None = None, parallel: bool = False) -> tuple[list[dict], list[str]]:
+    """Fresh gauges plus the same stale fallback the menubar uses. Does not notify.
+
+    The menubar calls this with no extra arguments, so it still fetches every source,
+    in order. The CLI passes max_age to reuse a recent sample and parallel to fetch
+    whatever is left at the same time.
+    """
+    names = list(SOURCE_FUNCS) if which is None else which
     try:
         last_ok = json.loads(LAST_OK_FILE.read_text()) if LAST_OK_FILE.exists() else {}
     except Exception:
         last_ok = {}
-    for source in SOURCES:
-        name = source.__name__.split("_")[0]
+    if not isinstance(last_ok, dict):
+        last_ok = {}
+    gauges: list[dict] = []
+    needed: list[str] = []
+    for name in names:
+        cached = last_ok.get(name) or []
+        age = _sample_age(cached) if isinstance(cached, list) and cached else None
+        if max_age is not None and isinstance(cached, list) and cached and age is not None and age <= max_age:
+            gauges += cached
+        else:
+            needed.append(name)
+    errors: list[str] = []
+    if needed:
+        fresh, errors = _fetch(needed, last_ok, parallel)
+        gauges += fresh
         try:
-            fresh = source()
-            gauges += fresh
-            if fresh:
-                last_ok[name] = fresh
-            else:
-                last_ok.pop(name, None)  # source deliberately absent (no login) - forget it
-        except Exception as e:  # keep the bar alive: last good numbers greyed out + the reason in the menu
-            why = str(e)[:80] if isinstance(e, (RuntimeError, ValueError)) else f"{type(e).__name__}: {str(e)[:70]}"
-            errors.append(f"{name}: {why}")
-            gauges += [{**g, "stale": True} for g in last_ok.get(name, [])]
-    try:
-        write_private(LAST_OK_FILE, last_ok)
-    except Exception:
-        pass
+            write_private(LAST_OK_FILE, last_ok)
+        except Exception:
+            pass
+    return gauges, errors
+
+
+def main() -> None:
+    gauges, errors = collect()
     try:
         notify([g for g in gauges if not g["stale"]])
     except Exception as e:
@@ -586,5 +683,147 @@ def main() -> None:
     print(json.dumps({"gauges": gauges, "errors": errors}, ensure_ascii=False))
 
 
+# --- CLI ----------------------------------------------------------------------
+# Every window, grouped by account. The percent is how much of that limit is used.
+
+MARKS = {"claude": "✳", "gemini": "✦", "codex": "⚛", "grok": "✕"}
+NAME_COLOR = {"claude": "38;2;204;120;92", "gemini": "38;2;87;140;245", "codex": "38;2;115;184;161", "grok": "1"}
+BAR_WIDTH = 20
+_EIGHTH = "▏▎▍▌▋▊▉"
+
+
+def window_name(g: dict) -> str:
+    raw = g.get("label") or g.get("id") or ""
+    left, sep, right = raw.partition(" · ")
+    if not sep:
+        return raw
+    for src, dst in _WINDOW_WORDS:
+        right = right.replace(src, dst)
+    prefix = {"Gemini": "gemini ", "Other models": "other models "}.get(left, "")
+    return f"{prefix}{right}".strip()
+
+
+def _errors_by_source(errors: list[str]) -> dict[str, str]:
+    out = {}
+    for error in errors:
+        name, sep, why = error.partition(": ")
+        if sep and name in SOURCE_FUNCS:
+            out[name] = why
+    return out
+
+
+def source_views(gauges: list[dict], errors: list[str], keys: list[str]) -> list[dict]:
+    why = _errors_by_source(errors)
+    views = []
+    for key in keys:
+        mine = [g for g in gauges if g.get("group") == key]
+        views.append({
+            "key": key, "name": SOURCE_NAME[key], "windows": mine,
+            "error": why.get(key), "missing": not mine and key not in why,
+        })
+    return views
+
+
+def _by_used(view: dict) -> tuple:
+    """Least-used account first, judging by its fullest window. Stale accounts follow."""
+    windows = view["windows"]
+    if not windows:
+        return (2, 0, view["name"])
+    stale = all(g.get("stale") for g in windows)
+    return (1 if stale else 0, max(int(g["percent"]) for g in windows), view["name"])
+
+
+def _paint(code: str, text: str, tty: bool) -> str:
+    if not tty:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _meter_code(percent: int) -> str:
+    if percent >= 80:
+        return "38;2;220;70;70"
+    if percent >= 50:
+        return "38;2;220;150;40"
+    return "38;2;80;180;120"
+
+
+def _bar(percent: int) -> str:
+    percent = max(0, min(100, int(percent)))
+    filled = percent / 100 * BAR_WIDTH
+    whole = int(filled)
+    eighth = int((filled - whole) * 8 + 1e-9)
+    if eighth >= 8:
+        whole += 1
+        eighth = 0
+    if whole >= BAR_WIDTH:
+        return "█" * BAR_WIDTH
+    parts = "█" * whole + (_EIGHTH[eighth - 1] if eighth else "")
+    return parts + "░" * (BAR_WIDTH - len(parts))
+
+
+def _blocks(views: list[dict], tty: bool, show_empty: bool) -> str:
+    chosen = []
+    for view in sorted(views, key=_by_used):
+        if view["windows"] or view.get("error") or show_empty:
+            chosen.append(view)
+    if not chosen:
+        return ""
+    width = max([len(window_name(g)) for view in chosen for g in view["windows"]], default=0)
+    blocks = []
+    for view in chosen:
+        title = _paint(NAME_COLOR.get(view["key"], "1"), f"{MARKS.get(view['key'], '•')} {view['name']}", tty)
+        lines = [title]
+        if not view["windows"]:
+            lines.append(f"  {view.get('error') or 'not signed in'}")
+        for g in view["windows"]:
+            used = int(g["percent"])
+            meter = _paint(_meter_code(used), f"{used:>3}%  {_bar(used)}", tty)
+            stale = _paint("2", "  stale", tty) if g.get("stale") else ""
+            lines.append(f"  {window_name(g):<{width}}  {meter}{stale}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n"
+
+
+def report_status(views: list[dict]) -> int:
+    return 0 if any(v["windows"] for v in views) else 1
+
+
+def format_report(views: list[dict], one: bool, tty: bool = False) -> str:
+    return _blocks(views[:1] if one else views, tty, show_empty=one)
+
+
+def running_as_cli(argv: list[str]) -> bool:
+    """The menubar runs `python3 usage.py` and reads JSON. A name of usagebar, or any argument, is the CLI."""
+    return Path(argv[0]).name in {"usagebar", "usagebar.py"} or len(argv) > 1
+
+
+def cli(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    parser = argparse.ArgumentParser(prog="usagebar", description="Show how much of each AI subscription limit is used.")
+    parser.add_argument("source", nargs="?", help="antigravity, grok, codex, or claude")
+    args = parser.parse_args(argv[1:])
+    if args.source is None:
+        keys, one = list(SOURCE_FUNCS), False
+    else:
+        key = CLI_SOURCES.get(args.source.lower())
+        if key is None:
+            parser.error(f"unknown source {args.source!r}; choose antigravity, grok, codex, or claude")
+        keys, one = [key], True
+    tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    gauges, errors = collect(keys, max_age=CLI_MAX_AGE, parallel=True)
+    views = source_views(gauges, errors, keys)
+    sys.stdout.write(format_report(views, one, tty))
+    return report_status(views)
+
+
 if __name__ == "__main__":
+    if running_as_cli(sys.argv):
+        try:
+            raise SystemExit(cli(sys.argv))
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            raise SystemExit(0)
     main()
