@@ -34,7 +34,7 @@ git clone <this repo> ~/usagebar
 
 Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 
-`./install.sh` also links `usagebar` into `~/.local/bin`, so the same numbers are available from any directory.
+`./install.sh` also links `usagebar` into `/usr/local/bin`, which is already on the default macOS `PATH`. That directory is owned by root, so the installer asks for an admin password. It also links `~/.local/bin/usagebar` for shells that already search there.
 
 ## CLI
 

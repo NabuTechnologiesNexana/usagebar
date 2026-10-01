@@ -27,7 +27,30 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -x UsageBar 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
+# ~/.local/bin is not on the default macOS PATH. /usr/local/bin is (/etc/paths).
+# That directory is root-owned, so the link there asks for an admin password.
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$DIR/usage.py" "$HOME/.local/bin/usagebar"
+
+CLI_LINK="/usr/local/bin/usagebar"
+current="$(readlink "$CLI_LINK" 2>/dev/null || true)"
+if [ -e "$CLI_LINK" ] || [ -L "$CLI_LINK" ]; then
+  case "$current" in
+    */usage.py) ;;
+    *)
+      echo "usagebar: $CLI_LINK exists and is not this script; not replacing it." >&2
+      exit 1
+      ;;
+  esac
+fi
+if [ -w /usr/local/bin ]; then
+  ln -sfn "$DIR/usage.py" "$CLI_LINK"
+else
+  echo "Linking usagebar into /usr/local/bin (admin password)..."
+  if [ ! -d /usr/local/bin ]; then
+    sudo mkdir -p /usr/local/bin
+  fi
+  sudo ln -sfn "$DIR/usage.py" "$CLI_LINK"
+fi
 echo "UsageBar installed: $PLIST"
-echo "CLI: $HOME/.local/bin/usagebar"
+echo "CLI: $CLI_LINK"
