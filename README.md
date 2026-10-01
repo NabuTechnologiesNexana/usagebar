@@ -34,6 +34,40 @@ git clone <this repo> ~/usagebar
 
 Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 
+`./install.sh` also links `usagebar` into `/usr/local/bin`, which is already on the default macOS `PATH`. That directory is owned by root, so the installer asks for an admin password. It also links `~/.local/bin/usagebar` for shells that already search there.
+
+## CLI
+
+`usagebar` prints every limit, grouped by account, least-used account first. The bar is how much of that limit is used. A sample newer than five minutes is reused, so the command does not wait when the menu bar already has the numbers. The menubar's JSON output is unchanged, and this command does not post a notification.
+
+```sh
+usagebar
+usagebar antigravity
+usagebar claude
+usagebar codex
+usagebar grok
+```
+
+```text
+✕ grok
+  week                  1%  ▏░░░░░░░░░░░░░░░░░░░
+
+✦ antigravity
+  gemini 5h             0%  ░░░░░░░░░░░░░░░░░░░░
+  gemini week           2%  ▍░░░░░░░░░░░░░░░░░░░
+  other models 5h       0%  ░░░░░░░░░░░░░░░░░░░░
+  other models week     0%  ░░░░░░░░░░░░░░░░░░░░
+
+✳ claude
+  5h                   11%  ██░░░░░░░░░░░░░░░░░░
+  week                 44%  █████████░░░░░░░░░░░
+
+⚛ codex
+  week                 80%  ████████████████░░░░
+```
+
+`antigravity` also accepts `gemini` and `agy`. A failed fetch keeps the last good numbers and marks the line `stale`.
+
 ## Where the numbers come from
 
 | Source | Credentials (read only, never stored by this tool) | Endpoint |
