@@ -11,6 +11,10 @@ Sources (each is skipped silently when its credentials are not on this Mac):
             language server on localhost is tried first when a CSRF token is provided.
   codex   - OpenAI Codex CLI rate limits (ChatGPT login) from ~/.codex/auth.json, via the
             endpoint CodexBar uses.
+  grok    - Grok Build subscription limits, the same numbers /usage shows in the CLI.
+            OAuth access token from ~/.grok/auth.json (never written by this tool),
+            sent only to cli-chat-proxy.grok.com. Weekly credit window, and the monthly
+            allowance when the account has one.
 
 When a source fails, its last good gauges are re-emitted with "stale": true (plus the error),
 so the bar keeps showing real numbers instead of dropping the section or inventing 0 %.
@@ -25,6 +29,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +42,9 @@ ANTIGRAVITY_CACHE = STATE_DIR / "antigravity_cache.json"
 ANTIGRAVITY_CACHE_TTL = 120  # a manual "Obnoviť" right after the timer should not spawn agy again
 ANTIGRAVITY_TIMEOUT = 40  # agy -p /usage takes 4-6 s warm, ~15 s cold
 CODEX_AUTH = Path.home() / ".codex/auth.json"
+GROK_AUTH = Path.home() / ".grok/auth.json"
+GROK_VERSION = Path.home() / ".grok/version.json"
+GROK_PROXY = os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com/v1").rstrip("/")
 
 
 # --- helpers -----------------------------------------------------------------
@@ -266,6 +274,270 @@ def codex_gauges() -> list[dict]:
     return out
 
 
+
+# --- Grok ---------------------------------------------------------------------
+# Same numbers the Grok CLI /usage modal shows. The weekly credit percent comes from
+# GET {cli-chat-proxy}/billing?format=credits; the monthly dollar allowance from
+# GET {cli-chat-proxy}/billing. Both want the OIDC access token stored at
+# ~/.grok/auth.json under "key", plus the CLI identity headers.
+# This file is only read. A token inside 2 minutes of expiry is renewed by
+# `grok models`, which is the CLI's own refresh — refresh-token rotation stays
+# inside grok, so a collector can never invalidate the login.
+# An API-key login has no subscription windows and is skipped, same as Codex.
+
+class GrokAuthExpired(RuntimeError):
+    pass
+
+
+def grok_client_version() -> str:
+    try:
+        version = json.loads(GROK_VERSION.read_text()).get("version")
+        if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
+            return version
+    except Exception:
+        pass
+    grok = find_binary("grok")
+    if not grok:
+        return "0.0.0"
+    try:
+        r = subprocess.run([grok, "--version"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except Exception:
+        return "0.0.0"
+    m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
+    return m.group(1) if m else "0.0.0"
+
+
+def grok_load_auth() -> dict:
+    try:
+        data = json.loads(GROK_AUTH.read_text())
+    except Exception as e:
+        raise RuntimeError(f"auth.json sa nedá čítať ({type(e).__name__})")
+    if not isinstance(data, dict):
+        raise RuntimeError("auth.json nemá očakávaný tvar")
+    return data
+
+
+def grok_credential(data: dict) -> dict | None:
+    """The OIDC session grok login wrote. API-key entries are not a subscription."""
+    best, best_exp = None, ""
+    for entry in data.values():
+        if not isinstance(entry, dict) or entry.get("auth_mode") != "oidc":
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        exp = entry.get("expires_at")
+        exp_s = exp if isinstance(exp, str) else ""
+        if best is None or exp_s > best_exp:
+            best, best_exp = entry, exp_s
+    return best
+
+
+def grok_token_fresh(entry: dict, skew_s: int = 120) -> bool:
+    exp = entry.get("expires_at")
+    if not isinstance(exp, str) or not exp:
+        return True  # unknown expiry: try the token, refresh only after a 401
+    try:
+        return parse_iso(exp) > datetime.now(timezone.utc) + timedelta(seconds=skew_s)
+    except Exception:
+        return True
+
+
+def grok_public_text(text: str) -> str:
+    text = re.sub(r"eyJ[A-Za-z0-9_\-]{8,}", "…", text)
+    line = text.strip().splitlines()
+    return (line[-1] if line else "")[:70]
+
+
+def grok_refresh_login() -> None:
+    grok = find_binary("grok")
+    if not grok:
+        raise RuntimeError("grok nie je nainštalované")
+    try:
+        r = subprocess.run([grok, "models"], capture_output=True, text=True, timeout=40, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("grok models neodpovedalo do 40 s")
+    if r.returncode != 0:
+        why = grok_public_text(r.stderr or r.stdout or "") or f"kód {r.returncode}"
+        raise RuntimeError(f"obnova prihlásenia zlyhala: {why}")
+
+
+def grok_access_token(force: bool = False) -> str | None:
+    if not GROK_AUTH.exists():
+        return None
+    entry = grok_credential(grok_load_auth())
+    if entry is None:
+        return None
+    if force or not grok_token_fresh(entry):
+        grok_refresh_login()
+        entry = grok_credential(grok_load_auth())
+        # skew 0: a just-refreshed token only has to be unexpired. A 401 on a token
+        # that is still in date falls through and surfaces on the retry.
+        if entry is None or not grok_token_fresh(entry, skew_s=0):
+            raise RuntimeError("prihlásenie Grok vypršalo, spusti grok login")
+    key = entry.get("key")
+    if not isinstance(key, str) or not key:
+        return None
+    return key
+
+
+def grok_percent(value: float, what: str) -> float:
+    if not 0 <= value <= 100.5:
+        raise ValueError(f"{what} mimo rozsah ({value})")
+    return min(100.0, value)
+
+
+def grok_money(raw: object) -> float | None:
+    if isinstance(raw, dict):
+        raw = raw.get("val")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
+
+
+def grok_optional_money(config: dict, key: str) -> float | None:
+    if key not in config or config[key] is None:
+        return None
+    value = grok_money(config[key])
+    if value is None:
+        raise ValueError(f"{key} má neznámy tvar")
+    return value
+
+
+def grok_reset(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parse_iso(value)
+    except Exception:
+        return None
+    return value
+
+
+def grok_credit_percent(config: dict) -> float | None:
+    """None when this payload has no credit window. 0 when the CLI omits a weekly percent."""
+    if "creditUsagePercent" in config and config["creditUsagePercent"] is not None:
+        raw = config["creditUsagePercent"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError("creditUsagePercent nie je číslo")
+        return grok_percent(float(raw), "creditUsagePercent")
+    products = config.get("productUsage")
+    if products is not None and not isinstance(products, list):
+        raise ValueError("productUsage nie je zoznam")
+    for item in products or []:
+        if not isinstance(item, dict):
+            raise ValueError("productUsage má neznámy tvar")
+        name = str(item.get("product") or "").lower().replace("-", "").replace("_", "")
+        if name not in ("grokbuild", "build"):
+            continue
+        raw = item.get("usagePercent")
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError("productUsage.usagePercent nie je číslo")
+        return grok_percent(float(raw), "productUsage")
+    period = config.get("currentPeriod")
+    if isinstance(period, dict) and "WEEK" in str(period.get("type") or "").upper():
+        return 0.0  # the CLI drops the field entirely while the week is still at 0 %
+    return None
+
+
+def grok_config(payload: dict) -> dict:
+    config = payload.get("config")
+    if isinstance(config, dict):
+        return config
+    if any(k in payload for k in ("creditUsagePercent", "monthlyLimit", "currentPeriod", "productUsage")):
+        return payload
+    raise RuntimeError("odpoveď bez config (zmenilo sa API?)")
+
+
+def grok_fetch(token: str, query: str) -> dict:
+    version = grok_client_version()
+    req = urllib.request.Request(f"{GROK_PROXY}/billing{query}", headers={
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": version,
+        "x-grok-client-identifier": "grok-shell",
+        "User-Agent": f"grok-cli/{version}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise GrokAuthExpired(f"billing HTTP {e.code}")
+        raise RuntimeError(f"billing HTTP {e.code}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("billing nevrátilo objekt")
+    return grok_config(payload)
+
+
+def grok_windows(weekly: dict, monthly: dict | None) -> list[tuple[str, str, str, float, str | None]]:
+    """(id, short, label, percent, reset). Raises on a shape that would otherwise draw a fake 0 %."""
+    out = []
+    period = weekly.get("currentPeriod") if isinstance(weekly.get("currentPeriod"), dict) else {}
+    kind = str(period.get("type") or "")
+    credits_monthly = "MONTH" in kind.upper() and "WEEK" not in kind.upper()
+    credit = grok_credit_percent(weekly)
+    if credit is not None:
+        label = "Grok · mesiac" if credits_monthly else "Grok · týždeň"
+        out.append(("grok:weekly", "K", label, credit,
+                    grok_reset(period.get("end")) or grok_reset(weekly.get("billingPeriodEnd"))))
+    if not credits_monthly and monthly:
+        limit = grok_optional_money(monthly, "monthlyLimit")
+        used = grok_optional_money(monthly, "used")
+        if limit is not None and limit > 0 and used is not None:
+            out.append(("grok:monthly", "K", "Grok · mesiac", grok_percent(used / limit * 100, "monthly"),
+                        grok_reset(monthly.get("billingPeriodEnd"))))
+        elif limit is not None and limit > 0 and used is None:
+            raise ValueError("monthlyLimit bez used")
+    # Pay-as-you-go rides the credits payload; the monthly payload is only a fallback.
+    cap = grok_optional_money(weekly, "onDemandCap")
+    spent = grok_optional_money(weekly, "onDemandUsed")
+    reset_source = weekly
+    if cap is None and monthly:
+        cap = grok_optional_money(monthly, "onDemandCap")
+        spent = grok_optional_money(monthly, "onDemandUsed")
+        reset_source = monthly
+    if cap is not None and cap > 0 and spent is not None:
+        reset = grok_reset(reset_source.get("billingPeriodEnd")) or grok_reset(period.get("end"))
+        out.append(("grok:ondemand", "K", "Grok · pay-as-you-go", grok_percent(spent / cap * 100, "onDemand"), reset))
+    elif cap is not None and cap > 0 and spent is None:
+        raise ValueError("onDemandCap bez onDemandUsed")
+    if not out:
+        raise RuntimeError("billing bez okien (účet bez limitov?)")
+    return out
+
+
+def grok_gauges() -> list[dict]:
+    if not find_binary("grok") or not GROK_AUTH.exists():
+        return []
+    token = grok_access_token()
+    if not token:
+        return []
+    def pair(tok: str) -> tuple[dict, dict | None]:
+        weekly_cfg = grok_fetch(tok, "?format=credits")
+        try:
+            monthly_cfg = grok_fetch(tok, "")
+        except GrokAuthExpired:
+            raise
+        except RuntimeError as e:
+            if "HTTP 404" not in str(e):
+                raise
+            monthly_cfg = None  # a plan with only the weekly credit window
+        return weekly_cfg, monthly_cfg
+
+    try:
+        weekly, monthly = pair(token)
+    except GrokAuthExpired:
+        token = grok_access_token(force=True)
+        if not token:
+            raise RuntimeError("prihlásenie Grok vypršalo, spusti grok login")
+        weekly, monthly = pair(token)
+    return [gauge(*row, "grok") for row in grok_windows(weekly, monthly)]
+
+
 # --- notifications ------------------------------------------------------------
 
 def notify(gauges: list[dict]) -> None:
@@ -281,7 +553,7 @@ def notify(gauges: list[dict]) -> None:
     NOTIFIED_FILE.write_text(json.dumps({k: v for k, v in seen.items() if k.split("@", 1)[1] > now_key}))
 
 
-SOURCES = [claude_gauges, gemini_gauges, codex_gauges]
+SOURCES = [claude_gauges, gemini_gauges, codex_gauges, grok_gauges]
 
 
 def main() -> None:
