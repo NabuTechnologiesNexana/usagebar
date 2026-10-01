@@ -1,5 +1,6 @@
 // Zero-dependency macOS menubar app. Runs usage.py every 5 minutes and renders its JSON:
-// menubar = vendor mark + current 5 h usage per vendor, menu = where to switch next + progress bar per gauge.
+// menubar = vendor mark + current window per vendor (5 h, or Grok's weekly limit),
+// menu = where to switch next + progress bar per gauge.
 // Build: swiftc -O -o UsageBar UsageBar.swift   (see install.sh)
 import Cocoa
 
@@ -14,11 +15,11 @@ struct Payload: Decodable { let gauges: [Gauge]; let errors: [String] }
 let scriptPath = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("usage.py").path
-let groupOrder = ["claude", "gemini", "codex"]
-let headline = ["claude:session", "antigravity:gemini-5h", "codex:primary_window"]  // menubar = the current 5 h windows
+let groupOrder = ["claude", "gemini", "codex", "grok"]
+let headline = ["claude:session", "antigravity:gemini-5h", "codex:primary_window", "grok:weekly"]  // menubar = the current window per vendor
 let refreshSeconds: TimeInterval = 300
-let groupTitles = ["claude": "CLAUDE", "gemini": "GEMINI (Antigravity)", "codex": "CODEX"]
-let groupNames = ["claude": "Claude", "gemini": "Gemini", "codex": "Codex"]
+let groupTitles = ["claude": "CLAUDE", "gemini": "GEMINI (Antigravity)", "codex": "CODEX", "grok": "GROK"]
+let groupNames = ["claude": "Claude", "gemini": "Gemini", "codex": "Codex", "grok": "Grok"]
 
 // The gauge that limits work in a vendor right now: the fullest window. For Antigravity only the
 // Gemini group counts (the Claude/GPT-through-Antigravity quota is a separate pool).
@@ -31,10 +32,66 @@ func color(_ p: Int) -> NSColor {
     p >= 80 ? .systemRed : p >= 50 ? .systemOrange : .systemGreen
 }
 
+// Grok's menubar slot is the weekly credit window. A plan with only a monthly
+// allowance (or only pay-as-you-go) still gets one mark instead of disappearing.
+func headlineGauge(_ gauges: [Gauge], _ id: String) -> Gauge? {
+    if let g = gauges.first(where: { $0.id == id }) { return g }
+    if id == "grok:weekly" {
+        return gauges.first { $0.id == "grok:monthly" } ?? gauges.first { $0.id == "grok:ondemand" }
+    }
+    return nil
+}
 
-// Vendor marks: the official logo shapes from icons/<group>.svg (Simple Icons, CC0 collection;
-// the marks themselves stay their owners' trademarks), tinted per vendor. If a file is missing
-// the in-house vector rendition below is drawn instead, so the app still needs no assets.
+// The status item measures an image's point size. It does not measure text-attachment
+// bounds, so an attributed title stays the width of the three older vendors and Grok,
+// added last, is clipped off the menu bar. Paint the whole headline into one image.
+func menuBarImage(_ gauges: [Gauge]) -> NSImage {
+    let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    struct Slot { let mark: NSImage; let text: String; let tint: NSColor; let textWidth: CGFloat }
+    var slots: [Slot] = []
+    for id in headline {
+        guard let g = headlineGauge(gauges, id) else { continue }
+        let text = " \(g.percent)%"
+        let tint: NSColor = g.isStale ? .tertiaryLabelColor : color(g.percent)
+        slots.append(Slot(mark: vendorGlyph(g.group, size: 13, tint: g.isStale ? .tertiaryLabelColor : nil),
+                          text: text, tint: tint,
+                          textWidth: ceil((text as NSString).size(withAttributes: [.font: font]).width)))
+    }
+    let height: CGFloat = 18
+    let mark: CGFloat = 13
+    let gap: CGFloat = 12
+    let pad: CGFloat = 4
+    if slots.isEmpty {
+        let text = "usage ?"
+        let width = ceil((text as NSString).size(withAttributes: [.font: font]).width) + pad * 2
+        return NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
+            (text as NSString).draw(at: NSPoint(x: pad, y: 2), withAttributes: [.font: font, .foregroundColor: NSColor.labelColor])
+            return true
+        }
+    }
+    let width = pad * 2 + slots.reduce(CGFloat(0)) { $0 + mark + 2 + $1.textWidth } + gap * CGFloat(max(slots.count - 1, 0))
+    let image = NSImage(size: NSSize(width: ceil(width), height: height), flipped: false) { rect in
+        var x = pad
+        for (i, slot) in slots.enumerated() {
+            slot.mark.draw(in: NSRect(x: x, y: (rect.height - mark) / 2, width: mark, height: mark))
+            x += mark + 2
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: slot.tint]
+            let textHeight = (slot.text as NSString).size(withAttributes: attrs).height
+            (slot.text as NSString).draw(at: NSPoint(x: x, y: (rect.height - textHeight) / 2), withAttributes: attrs)
+            x += slot.textWidth
+            if i + 1 < slots.count { x += gap }
+        }
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+
+// Vendor marks: the logo shapes from icons/<group>.svg, tinted per vendor. Claude, Gemini and
+// Codex are the Simple Icons paths (CC0 collection; the marks stay their owners' trademarks).
+// The xAI mark is the same kind of one-colour silhouette. If a file is missing the in-house
+// vector rendition below is drawn instead, so the app still needs no assets.
 let iconDir = URL(fileURLWithPath: scriptPath).deletingLastPathComponent().appendingPathComponent("icons")
 var iconCache: [String: NSImage?] = [:]
 func brandIcon(_ group: String) -> NSImage? {
@@ -48,6 +105,10 @@ func vendorColor(_ group: String) -> NSColor {
     switch group {
     case "claude": return NSColor(srgbRed: 0.80, green: 0.47, blue: 0.36, alpha: 1)   // Anthropic clay
     case "gemini": return NSColor(srgbRed: 0.34, green: 0.55, blue: 0.96, alpha: 1)   // Google blue
+    case "grok":                                                                  // xAI mark is black or white
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return dark ? NSColor(srgbRed: 0.94, green: 0.95, blue: 0.96, alpha: 1)
+                    : NSColor(srgbRed: 0.13, green: 0.13, blue: 0.14, alpha: 1)
     default: return NSColor(srgbRed: 0.45, green: 0.72, blue: 0.63, alpha: 1)         // OpenAI teal
     }
 }
@@ -88,6 +149,29 @@ func vendorGlyph(_ group: String, size: CGFloat, tint: NSColor? = nil) -> NSImag
                 path.curve(to: next, controlPoint1: c1, controlPoint2: c2)
             }
             path.close(); path.fill()
+        case "grok":                                      // same silhouette as icons/grok.svg
+            let polys: [[NSPoint]] = [
+                [NSPoint(x: 22.85, y: 6.14), NSPoint(x: 23.13, y: 6.97), NSPoint(x: 19.49, y: 8.23),
+                 NSPoint(x: 12.77, y: 11.72), NSPoint(x: 8.43, y: 14.79), NSPoint(x: 5.07, y: 17.86),
+                 NSPoint(x: 0.87, y: 17.86), NSPoint(x: 5.35, y: 14.09), NSPoint(x: 10.25, y: 11.02),
+                 NSPoint(x: 17.81, y: 7.67), NSPoint(x: 22.71, y: 6.28)],
+                [NSPoint(x: 14.87, y: 12.14), NSPoint(x: 22.85, y: 17.86), NSPoint(x: 19.63, y: 17.86),
+                 NSPoint(x: 13.19, y: 13.12), NSPoint(x: 14.73, y: 12.28)],
+                [NSPoint(x: 11.93, y: 13.95), NSPoint(x: 17.39, y: 17.86), NSPoint(x: 14.31, y: 17.86),
+                 NSPoint(x: 13.33, y: 17.16), NSPoint(x: 7.73, y: 17.16), NSPoint(x: 8.71, y: 16.33),
+                 NSPoint(x: 11.79, y: 16.33), NSPoint(x: 10.39, y: 15.07), NSPoint(x: 11.79, y: 14.09)],
+                [NSPoint(x: 2.27, y: 9.07), NSPoint(x: 5.35, y: 9.07), NSPoint(x: 7.87, y: 10.88),
+                 NSPoint(x: 6.19, y: 12.00), NSPoint(x: 2.41, y: 9.21)],
+            ]
+            let path = NSBezierPath()
+            for poly in polys {
+                let pts = poly.map { NSPoint(x: rect.minX + $0.x / 24 * rect.width,
+                                              y: rect.minY + (24 - $0.y) / 24 * rect.height) }
+                path.move(to: pts[0])
+                for p in pts.dropFirst() { path.line(to: p) }
+                path.close()
+            }
+            path.fill()
         default:                                          // interlocking rosette
             let path = NSBezierPath()
             for i in 0..<3 {
@@ -195,7 +279,8 @@ final class SwitchRow: NSView {
 final class BarRow: NSView {
     init(_ g: Gauge) {
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 42))
-        let name = g.label.hasPrefix("Gemini · ") || g.label.hasPrefix("Claude · ") || g.label.hasPrefix("Codex · ") ? g.window : g.label
+        let stripped = g.label.hasPrefix("Gemini · ") || g.label.hasPrefix("Claude · ") || g.label.hasPrefix("Codex · ") || g.label.hasPrefix("Grok · ")
+        let name = stripped ? g.window : g.label
         let label = NSTextField(labelWithString: name)
         label.frame = NSRect(x: 37, y: 22, width: 190, height: 16); label.font = .systemFont(ofSize: 12)
         let pct = NSTextField(labelWithString: "\(g.percent) %")
@@ -220,6 +305,7 @@ final class App: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "…"
+        item.button?.imageScaling = .scaleNone
         item.menu = menu
         refresh()
         Timer.scheduledTimer(withTimeInterval: refreshSeconds, repeats: true) { _ in self.refresh() }
@@ -250,17 +336,15 @@ final class App: NSObject, NSApplicationDelegate {
         let ranked = groupOrder.map { ($0, limiting(gauges, $0)) }
             .sorted { a, b in (a.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) > (b.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) }
 
-        let title = NSMutableAttributedString()
-        let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        for id in headline {
-            guard let g = gauges.first(where: { $0.id == id }) else { continue }
-            let mark = NSTextAttachment(); mark.image = vendorGlyph(g.group, size: 12, tint: g.isStale ? .tertiaryLabelColor : nil)
-            mark.bounds = NSRect(x: 0, y: -2, width: 12, height: 12)
-            title.append(NSAttributedString(attachment: mark))
-            let tint: NSColor = g.isStale ? .tertiaryLabelColor : color(g.percent)
-            title.append(NSAttributedString(string: " \(g.percent)%   ", attributes: [.font: numberFont, .foregroundColor: tint]))
-        }
-        item.button?.attributedTitle = title.length > 0 ? title : NSAttributedString(string: "usage ?")
+        let image = menuBarImage(gauges)
+        item.button?.attributedTitle = NSAttributedString(string: "")
+        item.button?.title = ""
+        item.button?.image = image
+        item.button?.imagePosition = .imageOnly
+        item.button?.imageScaling = .scaleNone
+        // variableLength sizes an image correctly, but the button's own insets still shave
+        // the trailing percent. Keep a few points past the image so Grok stays whole.
+        item.length = image.size.width + 14
 
         menu.removeAllItems()
         if ranked.contains(where: { $0.1 != nil }) {
