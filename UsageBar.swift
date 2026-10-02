@@ -6,11 +6,13 @@ import Cocoa
 
 struct Gauge: Decodable {
     let id: String; let short: String; let label: String; let percent: Int; let reset: String?; let group: String
-    let fetchedAt: String?; let stale: Bool?
+    let fetchedAt: String?; let stale: Bool?; let windowSeconds: Int?
     var isStale: Bool { stale ?? false }
     var window: String { label.contains("·") ? String(label.split(separator: "·").last!).trimmingCharacters(in: .whitespaces) : label }
 }
-struct Payload: Decodable { let gauges: [Gauge]; let errors: [String] }
+struct Session: Decodable { let key: String; let tool: String; let label: String; let detail: String?; let elapsed: Int }
+struct Payload: Decodable { let gauges: [Gauge]; let errors: [String]; let plans: [String: String]?; let sessions: [Session]? }
+struct SessionsPayload: Decodable { let sessions: [Session] }
 
 let scriptPath = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
@@ -18,6 +20,8 @@ let scriptPath = CommandLine.arguments.count > 1
 let groupOrder = ["claude", "gemini", "codex", "grok"]
 let headline = ["claude:session", "antigravity:gemini-5h", "codex:primary_window", "grok:weekly"]  // menubar = the current window per vendor
 let refreshSeconds: TimeInterval = 300
+let sessionPollSeconds: TimeInterval = 30   // cheap ps-only poll: elapsed times and "dobehol" notifications
+let clockFlipSeconds: TimeInterval = 5      // a running vendor's slot alternates percent / elapsed at this pace
 let groupTitles = ["claude": "CLAUDE", "gemini": "GEMINI (Antigravity)", "codex": "CODEX", "grok": "GROK"]
 let groupNames = ["claude": "Claude", "gemini": "Gemini", "codex": "Codex", "grok": "Grok"]
 
@@ -45,14 +49,17 @@ func headlineGauge(_ gauges: [Gauge], _ id: String) -> Gauge? {
 // The status item measures an image's point size. It does not measure text-attachment
 // bounds, so an attributed title stays the width of the three older vendors and Grok,
 // added last, is clipped off the menu bar. Paint the whole headline into one image.
-func menuBarImage(_ gauges: [Gauge]) -> NSImage {
+// clocks: group -> elapsed text of the run in progress; the vendor's slot alternates between its
+// percent and that clock (every few seconds), so a running model is visible without an extra icon.
+func menuBarImage(_ gauges: [Gauge], clocks: [String: String] = [:]) -> NSImage {
     let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
     struct Slot { let mark: NSImage; let text: String; let tint: NSColor; let textWidth: CGFloat }
     var slots: [Slot] = []
     for id in headline {
         guard let g = headlineGauge(gauges, id) else { continue }
-        let text = " \(g.percent)%"
-        let tint: NSColor = g.isStale ? .tertiaryLabelColor : color(g.percent)
+        let clock = clocks[g.group]
+        let text = clock.map { " \($0)" } ?? " \(g.percent)%"
+        let tint: NSColor = clock != nil ? .systemOrange : g.isStale ? .tertiaryLabelColor : color(g.percent)
         slots.append(Slot(mark: vendorGlyph(g.group, size: 13, tint: g.isStale ? .tertiaryLabelColor : nil),
                           text: text, tint: tint,
                           textWidth: ceil((text as NSString).size(withAttributes: [.font: font]).width)))
@@ -217,6 +224,25 @@ func resetText(_ iso: String?) -> String {
     return String(format: "reset o %dh%02d", mins / 60, mins % 60)
 }
 
+func spanText(_ mins: Int) -> String {
+    if mins >= 2880 { return "\(mins / 1440) d" }
+    return String(format: "%dh%02d", mins / 60, mins % 60)
+}
+
+// "beží 1h20 · reset o 3h40": how long the window has been open (its length minus what is left).
+func windowText(_ g: Gauge) -> String {
+    let reset = resetText(g.reset)
+    guard let len = g.windowSeconds, let d = parseISO(g.reset) else { return reset }
+    let elapsed = Int((Double(len) - d.timeIntervalSinceNow) / 60)
+    guard elapsed > 0, elapsed < len / 60 + 1 else { return reset }
+    return "beží \(spanText(elapsed)) · \(reset)"
+}
+
+func elapsedClock(_ seconds: Int) -> String {
+    let h = seconds / 3600, m = (seconds % 3600) / 60, s = seconds % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+}
+
 func agoText(_ iso: String?) -> String {
     guard let d = parseISO(iso) else { return "" }
     let mins = max(0, Int(-d.timeIntervalSinceNow / 60))
@@ -238,7 +264,7 @@ final class Bar: NSView {
 }
 
 final class SectionHeader: NSView {
-    init(title: String, group: String?, status: String = "") {
+    init(title: String, group: String?, status: String = "", plan: String? = nil) {
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
         if let group = group {
             let icon = NSImageView(frame: NSRect(x: 18, y: 6, width: 13, height: 13))
@@ -248,9 +274,10 @@ final class SectionHeader: NSView {
         label.frame = NSRect(x: group == nil ? 18 : 37, y: 5, width: 180, height: 15)
         label.font = .systemFont(ofSize: 10, weight: .semibold)
         label.textColor = group.map(vendorColor) ?? .secondaryLabelColor
-        let right = NSTextField(labelWithString: status)
+        let right = NSTextField(labelWithString: status.isEmpty ? (plan ?? "") : status)
         right.frame = NSRect(x: 160, y: 5, width: 142, height: 15); right.alignment = .right
-        right.font = .systemFont(ofSize: 10); right.textColor = .systemOrange
+        right.font = .systemFont(ofSize: 10, weight: status.isEmpty ? .semibold : .regular)
+        right.textColor = status.isEmpty ? .secondaryLabelColor : .systemOrange
         [label, right].forEach(addSubview)
     }
     required init?(coder: NSCoder) { nil }
@@ -286,7 +313,7 @@ final class BarRow: NSView {
         let pct = NSTextField(labelWithString: "\(g.percent) %")
         pct.frame = NSRect(x: 230, y: 22, width: 72, height: 16); pct.alignment = .right
         pct.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold); pct.textColor = color(g.percent)
-        let reset = NSTextField(labelWithString: resetText(g.reset))
+        let reset = NSTextField(labelWithString: windowText(g))
         reset.frame = NSRect(x: 37, y: 4, width: 265, height: 13)
         reset.font = .systemFont(ofSize: 10); reset.textColor = .tertiaryLabelColor
         let bar = Bar(frame: NSRect(x: 37, y: 17, width: 265, height: 4), percent: g.percent)
@@ -296,11 +323,54 @@ final class BarRow: NSView {
     required init?(coder: NSCoder) { nil }
 }
 
+// A claude turn / codex run / agy call in progress: what, for how long.
+final class SessionRow: NSView {
+    init(_ s: Session) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 34))
+        let group = s.tool == "agy" ? "gemini" : s.tool  // claude, codex, grok map 1:1 to their vendor
+        let icon = NSImageView(frame: NSRect(x: 18, y: 12, width: 13, height: 13))
+        icon.image = vendorGlyph(group, size: 13)
+        let name = NSTextField(labelWithString: s.label)
+        name.frame = NSRect(x: 37, y: 15, width: 190, height: 16); name.font = .systemFont(ofSize: 12, weight: .semibold)
+        let clock = NSTextField(labelWithString: elapsedClock(s.elapsed))
+        clock.frame = NSRect(x: 220, y: 15, width: 82, height: 16); clock.alignment = .right
+        clock.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold); clock.textColor = .systemOrange
+        let sub = NSTextField(labelWithString: s.detail ?? "")
+        sub.frame = NSRect(x: 37, y: 2, width: 265, height: 13); sub.font = .systemFont(ofSize: 10); sub.textColor = .tertiaryLabelColor
+        [icon, name, clock, sub].forEach(addSubview)
+    }
+    required init?(coder: NSCoder) { nil }
+}
+
 final class App: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
     var refreshing = false
     var refreshItem: NSMenuItem?
+    var lastPayload: Payload?
+    var lastErrors: [String] = []
+    var sessions: [Session] = []
+    var sessionsAt = Date()       // elapsed values are as of this poll; the clock keeps counting between polls
+    var showClock = false
+
+    func elapsedNow(_ s: Session) -> Int { s.elapsed + Int(Date().timeIntervalSince(sessionsAt)) }
+
+    // Longest run per vendor, as menubar clock text; empty when nothing runs or in the percent phase.
+    func barClocks() -> [String: String] {
+        guard showClock else { return [:] }
+        var out: [String: String] = [:]
+        for s in sessions {
+            let group = s.tool == "agy" ? "gemini" : s.tool  // claude, codex, grok map 1:1 to their vendor
+            if out[group] == nil { out[group] = elapsedClock(elapsedNow(s)) }
+        }
+        return out
+    }
+
+    func updateBarImage() {
+        let image = menuBarImage(lastPayload?.gauges ?? [], clocks: barClocks())
+        item.button?.image = image
+        item.length = image.size.width + 14
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -309,6 +379,25 @@ final class App: NSObject, NSApplicationDelegate {
         item.menu = menu
         refresh()
         Timer.scheduledTimer(withTimeInterval: refreshSeconds, repeats: true) { _ in self.refresh() }
+        Timer.scheduledTimer(withTimeInterval: sessionPollSeconds, repeats: true) { _ in self.pollSessions() }
+        Timer.scheduledTimer(withTimeInterval: clockFlipSeconds, repeats: true) { _ in
+            guard !self.sessions.isEmpty || self.showClock else { return }
+            self.showClock.toggle(); self.updateBarImage()
+        }
+    }
+
+    // Runs `usage.py --sessions` (ps only, no network): keeps the clocks moving and fires the
+    // "dobehol" notification within half a minute of a run ending.
+    func pollSessions() {
+        DispatchQueue.global().async {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/python3"); p.arguments = [scriptPath, "--sessions"]
+            let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return }
+            let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            guard let parsed = try? decoder.decode(SessionsPayload.self, from: data) else { return }
+            DispatchQueue.main.async { self.sessions = parsed.sessions; self.sessionsAt = Date(); self.render(self.lastPayload, self.lastErrors) }
+        }
     }
 
     func refresh() {
@@ -327,16 +416,22 @@ final class App: NSObject, NSApplicationDelegate {
             do { payload = try decoder.decode(Payload.self, from: data) } catch { errors.append("JSON: \(String(describing: error).prefix(120))") }
             if p.terminationStatus != 0 { errors.append("usage.py skončil s kódom \(p.terminationStatus)") }
             if payload == nil && !stderr.isEmpty { errors.append(String(stderr.trimmingCharacters(in: .whitespacesAndNewlines).suffix(200))) }
-            DispatchQueue.main.async { self.refreshing = false; self.render(payload, errors) }
+            DispatchQueue.main.async {
+                self.refreshing = false
+                if let p = payload { self.lastPayload = p; if let s = p.sessions { self.sessions = s; self.sessionsAt = Date() } }
+                self.lastErrors = errors
+                self.render(payload ?? self.lastPayload, errors)
+            }
         }
     }
 
     func render(_ payload: Payload?, _ extraErrors: [String]) {
         let gauges = payload?.gauges ?? []
+        let plans = payload?.plans ?? [:]
         let ranked = groupOrder.map { ($0, limiting(gauges, $0)) }
             .sorted { a, b in (a.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) > (b.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) }
 
-        let image = menuBarImage(gauges)
+        let image = menuBarImage(gauges, clocks: barClocks())
         item.button?.attributedTitle = NSAttributedString(string: "")
         item.button?.title = ""
         item.button?.image = image
@@ -347,6 +442,15 @@ final class App: NSObject, NSApplicationDelegate {
         item.length = image.size.width + 14
 
         menu.removeAllItems()
+        if !sessions.isEmpty {
+            let h = NSMenuItem(); h.isEnabled = false; h.view = SectionHeader(title: "Beží teraz", group: nil); menu.addItem(h)
+            for s in sessions {
+                let mi = NSMenuItem()
+                mi.view = SessionRow(Session(key: s.key, tool: s.tool, label: s.label, detail: s.detail, elapsed: elapsedNow(s)))
+                menu.addItem(mi)
+            }
+            menu.addItem(.separator())
+        }
         if ranked.contains(where: { $0.1 != nil }) {
             let h = NSMenuItem(); h.isEnabled = false; h.view = SectionHeader(title: "Kam prepnúť teraz", group: nil); menu.addItem(h)
             for (i, (group, g)) in ranked.enumerated() {
@@ -360,7 +464,7 @@ final class App: NSObject, NSApplicationDelegate {
                 if !lastGroup.isEmpty { menu.addItem(.separator()) }
                 let h = NSMenuItem(); h.isEnabled = false
                 let status = g.isStale ? "zastarané · \(agoText(g.fetchedAt))" : ""
-                h.view = SectionHeader(title: groupTitles[g.group] ?? g.group.uppercased(), group: g.group, status: status)
+                h.view = SectionHeader(title: groupTitles[g.group] ?? g.group.uppercased(), group: g.group, status: status, plan: plans[g.group])
                 menu.addItem(h); lastGroup = g.group
             }
             let mi = NSMenuItem(); mi.view = BarRow(g); menu.addItem(mi)
