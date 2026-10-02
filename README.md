@@ -11,22 +11,14 @@ No dependencies: one Python script (system `/usr/bin/python3`) + one Swift file 
 ✳ 29%   ✦ 0%   ⚛ 6%   ✕ 12%   ← menubar: vendor mark + current window per vendor
 ```
 
-While a Claude Code turn, a `codex exec` or an `agy -p` run is in progress, that vendor's slot
-alternates every 3 s between its percent and the elapsed time of the run (orange).
-
-Click for **Beží teraz** (runs in progress: project, model, tokens written so far, elapsed),
-**Kam prepnúť teraz** (vendors ranked by headroom, with the limiting window and its reset) and
-all gauges grouped by vendor, with the subscription name in the header (Max 5×, Plus), progress
-bars and, for every window, how long it has been open and when it resets ("beží 1h20 · reset o 3h40"). When a source
+Click for **Kam prepnúť teraz** (vendors ranked by headroom, with the limiting window and its
+reset) and all gauges grouped by vendor, with progress bars and reset countdowns. The vendor
+header shows the subscription behind the limits where it can be read locally: Claude (Keychain
+`rateLimitTier`, e.g. "Max 5×") and Codex (`chatgpt_plan_type` claim of the id_token in
+`~/.codex/auth.json`, e.g. "Plus"). Antigravity exposes no tier through `agy`, Grok is not read. When a source
 fails, its last good numbers stay in the menu greyed out with "zastarané · pred N min" and the
-reason as a ⚠ row; nothing is invented. macOS notifications: once per limit per reset window
-when it crosses 80 %; when a window that was at least 30 % used resets ("okno dobehlo"); when a
-source starts failing and when it is back; and when a run of at least 2 minutes has finished
-("dobehol po 12 min"). The runs are polled every 30 s with `usage.py --sessions` (ps only, no
-network). A Claude Code turn is read from its session log in `~/.claude/projects/`: it starts with
-the first prompt after the previous `end_turn` and ends with the assistant message whose
-`stop_reason` is `end_turn`; exit status of other tools is not observable, so a finished run is
-reported as finished, not as failed.
+reason as a ⚠ row; nothing is invented. A macOS notification fires once per limit per reset
+window when it crosses 80 %.
 
 Vendor marks live in `icons/` and are tinted per vendor. Claude, Gemini and Codex are the
 logo shapes from [Simple Icons](https://simpleicons.org) (CC0 collection; the marks remain
@@ -136,10 +128,7 @@ section turns grey and shows why. Use it as a personal convenience, not as somet
 | What | Where |
 |---|---|
 | Threshold for notifications | `NOTIFY_AT` in `usage.py` (or env `USAGEBAR_NOTIFY_AT`) |
-| Minimum run length for a "dobehol" notification | `USAGEBAR_SESSION_NOTIFY_MIN` (minutes, default 2) |
-| Minimum usage for an "okno dobehlo" notification | `USAGEBAR_RESET_NOTIFY_FROM` (percent, default 30) |
-| Percent / elapsed flip pace in the menubar | `clockFlipSeconds` in `UsageBar.swift` |
-| Subscription names | `CLAUDE_TIERS`, `codex_plan()`, `GROK_PLAN_KEYS` in `usage.py` (Keychain `rateLimitTier`, Codex id_token `chatgpt_plan_type`, any plan-like field of the Grok billing payload — untested, no Grok login on the dev machine). Antigravity exposes no tier through `agy`, so Gemini has none |
+| Subscription names | `CLAUDE_TIERS`, `codex_plan()` in `usage.py` |
 | Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
 | Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
 | Which window ranks a vendor in "Kam prepnúť teraz" | `limiting()` in `UsageBar.swift` (the fullest window; for Antigravity only the Gemini group) |

@@ -3,7 +3,8 @@
 
 The menubar runs `python3 usage.py` with no arguments. That prints one JSON object:
 
-    {"gauges": [{"id", "short", "label", "percent", "reset", "group"}], "errors": [...]}
+    {"gauges": [{"id", "short", "label", "percent", "reset", "group"}], "errors": [...],
+     "plans": {"claude": "Max 5×", "codex": "Plus"}}
 
 Invoked as `usagebar`, it prints every window for every signed-in account.
 `usagebar antigravity|grok|codex|claude` prints that account. A sample newer
@@ -25,11 +26,7 @@ Sources (each is skipped silently when its credentials are not on this Mac):
 
 When a source fails, its last good gauges are re-emitted with "stale": true (plus the error),
 so the bar keeps showing real numbers instead of dropping the section or inventing 0 %.
-Sends one macOS notification per limit per reset window when it crosses NOTIFY_AT, one when a
-used window resets ("okno dobehlo"), one when a source starts failing / is back, and one when a
-claude / codex / agy run that lasted at least SESSION_NOTIFY_MIN minutes has finished.
-`usage.py --sessions` is the cheap ps-only poll the menubar runs every 30 s for the latter.
-The payload also carries "plans" (subscription name per vendor) and "sessions" (running processes).
+Sends one macOS notification per limit per reset window when it crosses NOTIFY_AT.
 Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatible.
 """
 from __future__ import annotations
@@ -52,12 +49,6 @@ STATE_DIR = Path(os.environ.get("USAGEBAR_STATE", Path.home() / "Library/Applica
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
 LAST_OK_FILE = STATE_DIR / "last_ok.json"
-WINDOWS_FILE = STATE_DIR / "windows.json"      # last seen reset per gauge, for "okno dobehlo" notifications
-ERRORS_FILE = STATE_DIR / "errors.json"        # sources currently failing, for "zdroj zlyhal / zase ide"
-SESSIONS_FILE = STATE_DIR / "sessions.json"    # running claude/codex/agy processes seen last time
-SESSION_NOTIFY_MIN = int(os.environ.get("USAGEBAR_SESSION_NOTIFY_MIN", "2"))  # notify only for runs at least this long
-RESET_NOTIFY_FROM = int(os.environ.get("USAGEBAR_RESET_NOTIFY_FROM", "30"))   # notify a reset only when the window was used at least this much
-HOUR, WEEK = 3600, 7 * 24 * 3600
 ANTIGRAVITY_CACHE = STATE_DIR / "antigravity_cache.json"
 ANTIGRAVITY_CACHE_TTL = 120  # a manual "Obnoviť" right after the timer should not spawn agy again
 ANTIGRAVITY_TIMEOUT = 40  # agy -p /usage takes 4-6 s warm, ~15 s cold
@@ -116,11 +107,9 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def gauge(id_: str, short: str, label: str, percent: float, reset: str | None, group: str,
-          window_seconds: int | None = None) -> dict:
-    """window_seconds lets the UI show how long the window has been running (reset - length)."""
+def gauge(id_: str, short: str, label: str, percent: float, reset: str | None, group: str) -> dict:
     return {"id": id_, "short": short, "label": label, "percent": int(round(percent)), "reset": reset, "group": group,
-            "fetched_at": now_iso(), "stale": False, "window_seconds": window_seconds}
+            "fetched_at": now_iso(), "stale": False}
 
 
 # --- Claude ------------------------------------------------------------------
@@ -145,7 +134,7 @@ def claude_gauges() -> list[dict]:
         else:
             continue
         id_ = f"claude:{kind}:{model}" if kind == "weekly_scoped" else f"claude:{kind}"  # scoped gauges must not share a notification key
-        out.append(gauge(id_, short, label, lim["percent"], lim["resets_at"], "claude", 5 * HOUR if kind == "session" else WEEK))
+        out.append(gauge(id_, short, label, lim["percent"], lim["resets_at"], "claude"))
     return out
 
 
@@ -153,7 +142,7 @@ CLAUDE_TIERS = {"max_5x": "Max 5×", "max_20x": "Max 20×", "max": "Max", "pro":
 
 
 def claude_plan() -> str | None:
-    """Plan name from the Keychain item Claude Code writes at login (rateLimitTier e.g. default_claude_max_5x)."""
+    """Plan name from the Keychain item Claude Code writes at login (rateLimitTier, e.g. default_claude_max_5x)."""
     raw = keychain("Claude Code-credentials")
     if not raw:
         return None
@@ -269,7 +258,7 @@ def gemini_gauges() -> list[dict]:
     rows = sorted(antigravity_buckets(summary), key=lambda t: (t[0] != "Gemini", t[2] != "5h"))  # Gemini group first, 5h first
     for name, bid, window, rem, reset in rows:
         out.append(gauge(f"antigravity:{bid}", "G" if name == "Gemini" else "A", f"{name} · {ANTIGRAVITY_WINDOWS[window]}",
-                         (1 - rem) * 100, reset, "gemini", 5 * HOUR if window == "5h" else WEEK))
+                         (1 - rem) * 100, reset, "gemini"))
     return out
 
 
@@ -307,14 +296,14 @@ def codex_gauges() -> list[dict]:
         reset = win.get("reset_at")
         if isinstance(reset, (int, float)):
             reset = datetime.fromtimestamp(reset, timezone.utc).isoformat()
-        out.append(gauge(f"codex:{key}", "X", f"Codex · {window}", used, reset, "codex", int(seconds) or None))
+        out.append(gauge(f"codex:{key}", "X", f"Codex · {window}", used, reset, "codex"))
     if not out:
         raise RuntimeError("rate_limit bez okien (účet bez limitov?)")
     return out
 
 
 def codex_plan() -> str | None:
-    """chatgpt_plan_type claim of the id_token in ~/.codex/auth.json (plus, pro, team, ...). Decoded locally."""
+    """chatgpt_plan_type claim of the id_token in ~/.codex/auth.json (plus, pro, team, ...). Decoded locally, never sent."""
     if not CODEX_AUTH.exists():
         return None
     token = (json.loads(CODEX_AUTH.read_text()).get("tokens") or {}).get("id_token")
@@ -327,13 +316,13 @@ def codex_plan() -> str | None:
     return str(plan).capitalize() if plan else None
 
 
-# Gemini / Antigravity is missing on purpose: `agy -p /usage` carries no tier field, and the
-# GetUserStatus RPC of the local language server needs a CSRF token this tool does not have.
-PLAN_FUNCS = {"claude": claude_plan, "codex": codex_plan, "grok": lambda: _grok_plan_seen}
+# Only vendors whose plan is readable locally with certainty. Antigravity exposes no tier
+# through agy; the Grok billing payload is undocumented and untested here.
+PLAN_FUNCS = {"claude": claude_plan, "codex": codex_plan}
 
 
 def collect_plans() -> dict[str, str]:
-    """Subscription names per vendor. Local reads only; a failure just leaves the vendor out."""
+    """Subscription name per vendor, e.g. {"claude": "Max 5×", "codex": "Plus"}. A failure just leaves the vendor out."""
     out = {}
     for name, fn in PLAN_FUNCS.items():
         try:
@@ -343,167 +332,6 @@ def collect_plans() -> dict[str, str]:
         if plan:
             out[name] = plan
     return out
-
-
-# --- running sessions ----------------------------------------------------------
-# The claude / codex / agy processes running right now, with their elapsed time, so the
-# menu can show "beží 1h12" and say when a long run has finished. Exit status is not
-# observable for processes this tool did not start; a finished run is reported as finished.
-
-SESSION_TOOLS = ("claude", "codex", "agy", "grok")
-SESSION_SKIP = ("--chrome-native-host", "app-server", "language_server", "ChatGPT.app", ".cursor/extensions", "mcp-server")
-CLAUDE_PROJECTS = Path.home() / ".claude/projects"
-CLAUDE_TURN_MAX_IDLE = 1800  # a turn with no log write for this long is a dead session, not a running one
-CLAUDE_MODELS = {"fable": "Fable", "opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"}
-
-
-def _etime_seconds(etime: str) -> int:
-    """ps etime: [[dd-]hh:]mm:ss"""
-    days, _, rest = etime.partition("-") if "-" in etime else ("0", "", etime)
-    parts = [int(x) for x in rest.split(":")]
-    while len(parts) < 3:
-        parts.insert(0, 0)
-    return int(days) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
-
-
-def _processes() -> list[tuple[int, int, list[str]]]:
-    r = subprocess.run(["/bin/ps", "-axo", "pid=,etime=,command="], capture_output=True, text=True, timeout=10)
-    out = []
-    for line in r.stdout.splitlines():
-        try:
-            pid_s, etime, cmd = line.split(None, 2)
-        except ValueError:
-            continue
-        if any(skip in cmd for skip in SESSION_SKIP):
-            continue
-        argv = cmd.split()
-        if argv and Path(argv[0]).name in SESSION_TOOLS:
-            out.append((int(pid_s), _etime_seconds(etime), argv))
-    return out
-
-
-def _cwd(pid: int) -> str | None:
-    lsof = find_binary("lsof")
-    if not lsof:
-        return None
-    r = subprocess.run([lsof, "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=10)
-    for line in r.stdout.splitlines():
-        if line.startswith("n/"):
-            return line[1:]
-    return None
-
-
-def _model_name(model_id: str) -> str:
-    """claude-fable-5-1 -> Fable 5.1"""
-    m = re.match(r"claude-([a-z]+)-(\d+)-(\d+)", model_id or "")
-    if not m:
-        return model_id or "?"
-    return f"{CLAUDE_MODELS.get(m.group(1), m.group(1).capitalize())} {m.group(2)}.{m.group(3)}"
-
-
-def claude_turn(cwd: str) -> dict | None:
-    """The newest session log for this working directory: is a turn running, since when, which model, how much written.
-    Reads only the tail of the log. A turn starts with the first real user prompt after the previous
-    end_turn (a prompt typed mid-turn is queued, it does not restart the clock) and ends with the
-    assistant message whose stop_reason is end_turn."""
-    project = CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cwd)
-    logs = [f for f in project.glob("*.jsonl")] if project.is_dir() else []
-    if not logs:
-        return None
-    log = max(logs, key=lambda f: f.stat().st_mtime)
-    idle = datetime.now(timezone.utc).timestamp() - log.stat().st_mtime
-    size = log.stat().st_size
-    window = 400_000
-    while True:  # a turn with big tool outputs can push its prompt far back: widen the tail until the prompt is in it
-        with open(log, "rb") as f:
-            f.seek(max(0, size - window))
-            tail = f.read().decode("utf-8", "replace").splitlines()
-        turn_start, in_turn, model, written, saw_end = None, False, "", 0, False
-        for line in tail:
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            kind, msg = d.get("type"), d.get("message") or {}
-            if kind == "user":
-                content = msg.get("content")
-                is_prompt = isinstance(content, str) or (isinstance(content, list) and
-                                                         any(isinstance(c, dict) and c.get("type") == "text" for c in content))
-                if is_prompt and not d.get("isMeta") and not in_turn:
-                    turn_start, in_turn, written = d.get("timestamp"), True, 0
-            elif kind == "assistant":
-                model = msg.get("model") or model
-                written += int((msg.get("usage") or {}).get("output_tokens") or 0)
-                if msg.get("stop_reason") == "end_turn":
-                    in_turn, saw_end = False, True
-        if saw_end or turn_start or window >= size:
-            break
-        window *= 4
-    if not turn_start:
-        return None
-    try:
-        started = parse_iso(turn_start)
-    except Exception:
-        return None
-    return {"active": in_turn and idle < CLAUDE_TURN_MAX_IDLE, "elapsed": int((datetime.now(timezone.utc) - started).total_seconds()),
-            "model": _model_name(model), "written": written, "project": Path(cwd).name, "log": str(log)}
-
-
-def running_sessions() -> list[dict]:
-    """codex / agy runs straight from ps; claude from its session log, so an idle interactive
-    window does not count as "running" and the elapsed time is the current turn, not the process."""
-    out, seen_logs = [], set()
-    for pid, elapsed, argv in _processes():
-        tool = Path(argv[0]).name
-        if tool == "claude":
-            cwd = _cwd(pid)
-            turn = claude_turn(cwd) if cwd else None
-            if not turn or not turn["active"] or turn["log"] in seen_logs:
-                continue
-            seen_logs.add(turn["log"])
-            out.append({"key": f"claude:{turn['log']}", "tool": "claude", "label": f"Claude · {turn['project']}",
-                        "detail": f"{turn['model']} · {turn['written'] / 1000:.1f}K napísaných", "elapsed": turn["elapsed"]})
-            continue
-        sub = next((a for a in argv[1:] if not a.startswith("-")), "")
-        label = f"{tool} {sub}" if sub in ("exec", "review", "resume") else tool
-        if tool == "agy" and "-p" in argv:
-            label = "agy -p"
-        out.append({"key": f"{tool}:{pid}", "tool": tool, "label": label, "detail": "", "elapsed": elapsed})
-    return sorted(out, key=lambda x: -x["elapsed"])
-
-
-def notify_sessions(sessions: list[dict]) -> None:
-    """One notification when a run seen last time is gone now (turn finished, process exited)
-    and it lasted at least SESSION_NOTIFY_MIN minutes."""
-    try:
-        seen = json.loads(SESSIONS_FILE.read_text()) if SESSIONS_FILE.exists() else {}
-    except Exception:
-        seen = {}
-    current = {s["key"]: s for s in sessions}
-    for key, old in seen.items():
-        if key in current:
-            continue
-        tool, _, ref = key.partition(":")
-        if tool != "claude":
-            try:
-                os.kill(int(ref), 0)
-                continue  # still alive, only filtered differently this time
-            except (ProcessLookupError, ValueError):
-                pass
-            except PermissionError:
-                continue
-        if old.get("elapsed", 0) >= SESSION_NOTIFY_MIN * 60:
-            detail = f" ({old['detail']})" if old.get("detail") else ""
-            post(f"{old.get('label', '?')} dobehol po {_duration(old.get('elapsed', 0))}{detail}", "Submarine")
-    try:
-        write_private(SESSIONS_FILE, current)
-    except Exception:
-        pass
-
-
-def _duration(seconds: int) -> str:
-    h, m = divmod(max(0, int(seconds)) // 60, 60)
-    return f"{h} h {m:02d} min" if h else f"{m} min"
 
 
 
@@ -519,20 +347,6 @@ def _duration(seconds: int) -> str:
 
 class GrokAuthExpired(RuntimeError):
     pass
-
-
-GROK_PLAN_KEYS = ("planName", "plan", "tier", "subscriptionTier", "productName")
-_grok_plan_seen: str | None = None  # filled by grok_gauges() from the billing payload, read by collect_plans()
-
-
-def grok_remember_plan(config: dict) -> None:
-    """Best effort: the billing payload is undocumented, so any plan-like string field is taken as the plan name."""
-    global _grok_plan_seen
-    for key in GROK_PLAN_KEYS:
-        value = config.get(key)
-        if isinstance(value, str) and 0 < len(value) <= 40:
-            _grok_plan_seen = value.replace("_", " ").strip().capitalize()
-            return
 
 
 def grok_client_version() -> str:
@@ -781,64 +595,10 @@ def grok_gauges() -> list[dict]:
         if not token:
             raise RuntimeError("prihlásenie Grok vypršalo, spusti grok login")
         weekly, monthly = pair(token)
-    grok_remember_plan(monthly or {})
-    grok_remember_plan(weekly)
     return [gauge(*row, "grok") for row in grok_windows(weekly, monthly)]
 
 
 # --- notifications ------------------------------------------------------------
-
-def post(message: str, sound: str = "Glass") -> None:
-    message = message.replace('"', "'")
-    subprocess.run(["osascript", "-e", f'display notification "{message}" with title "UsageBar" sound name "{sound}"'], timeout=10)
-
-
-def notify_resets(gauges: list[dict]) -> None:
-    """A window whose reset passed since the last sample has 'dobehlo': say so once, if it was in use."""
-    try:
-        seen = json.loads(WINDOWS_FILE.read_text()) if WINDOWS_FILE.exists() else {}
-    except Exception:
-        seen = {}
-    now = datetime.now(timezone.utc)
-    for g in gauges:
-        if not g.get("reset"):
-            continue
-        old = seen.get(g["id"])
-        try:
-            old_reset = parse_iso(old["reset"]) if old else None
-        except Exception:
-            old_reset = None
-        if old_reset and old_reset <= now and g["reset"] != old["reset"] and old.get("percent", 0) >= RESET_NOTIFY_FROM:
-            post(f"{g['label']}: okno dobehlo, limit je zase voľný (bolo {old['percent']} %)", "Hero")
-        seen[g["id"]] = {"reset": g["reset"], "percent": g["percent"]}
-    try:
-        write_private(WINDOWS_FILE, seen)
-    except Exception:
-        pass
-
-
-def notify_errors(errors: list[str]) -> None:
-    """Say once when a source starts failing and once when it is back."""
-    try:
-        was = json.loads(ERRORS_FILE.read_text()) if ERRORS_FILE.exists() else {}
-    except Exception:
-        was = {}
-    now_failing = {}
-    for e in errors:
-        name, sep, why = e.partition(": ")
-        if sep and name in SOURCE_FUNCS:
-            now_failing[name] = why
-    for name, why in now_failing.items():
-        if name not in was:
-            post(f"{SOURCE_NAME.get(name, name)} zlyhal: {why[:60]}", "Basso")
-    for name in was:
-        if name not in now_failing:
-            post(f"{SOURCE_NAME.get(name, name)} zase funguje", "Glass")
-    try:
-        write_private(ERRORS_FILE, now_failing)
-    except Exception:
-        pass
-
 
 def notify(gauges: list[dict]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -847,7 +607,8 @@ def notify(gauges: list[dict]) -> None:
     for g in gauges:
         key = f"{g['id']}@{(g['reset'] or '')[:16]}"  # one notification per limit per reset window (minute precision)
         if g["percent"] >= NOTIFY_AT and key not in seen:
-            post(f"{g['label']}: {g['percent']} %")
+            msg = f"{g['label']}: {g['percent']} %"
+            subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "UsageBar" sound name "Glass"'], timeout=10)
             seen[key] = True
     NOTIFIED_FILE.write_text(json.dumps({k: v for k, v in seen.items() if k.split("@", 1)[1] > now_key}))
 
@@ -965,31 +726,11 @@ def collect(which: list[str] | None = None, max_age: float | None = None, parall
 
 def main() -> None:
     gauges, errors = collect()
-    plans = collect_plans()
-    sessions = []
-    for step in (lambda: notify([g for g in gauges if not g["stale"]]),
-                 lambda: notify_resets([g for g in gauges if not g["stale"]]),
-                 lambda: notify_errors(errors)):
-        try:
-            step()
-        except Exception as e:
-            errors.append(f"notify: {e}")
     try:
-        sessions = running_sessions()
-        notify_sessions(sessions)
+        notify([g for g in gauges if not g["stale"]])
     except Exception as e:
-        errors.append(f"sessions: {e}")
-    print(json.dumps({"gauges": gauges, "errors": errors, "plans": plans, "sessions": sessions}, ensure_ascii=False))
-
-
-def sessions_main() -> None:
-    """Cheap poll (ps only) the menubar runs every half minute: elapsed times + finished-run notifications."""
-    sessions = running_sessions()
-    try:
-        notify_sessions(sessions)
-    except Exception:
-        pass
-    print(json.dumps({"sessions": sessions}, ensure_ascii=False))
+        errors.append(f"notify: {e}")
+    print(json.dumps({"gauges": gauges, "errors": errors, "plans": collect_plans()}, ensure_ascii=False))
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -1031,16 +772,6 @@ def source_views(gauges: list[dict], errors: list[str], keys: list[str], plans: 
             "error": why.get(key), "missing": not mine and key not in why,
         })
     return views
-
-
-def format_sessions(sessions: list[dict], tty: bool) -> str:
-    if not sessions:
-        return ""
-    lines = [_paint("1", "⏱ beží", tty)]
-    for s in sessions:
-        detail = f"  {s['detail']}" if s.get("detail") else ""
-        lines.append(f"  {s['label']:<22}  {_duration(s['elapsed'])}{detail}")
-    return "\n".join(lines) + "\n"
 
 
 def _by_used(view: dict) -> tuple:
@@ -1090,10 +821,9 @@ def _blocks(views: list[dict], tty: bool, show_empty: bool) -> str:
     width = max([len(window_name(g)) for view in chosen for g in view["windows"]], default=0)
     blocks = []
     for view in chosen:
-        plan = view.get("plan")
         title = _paint(NAME_COLOR.get(view["key"], "1"), f"{MARKS.get(view['key'], '•')} {view['name']}", tty)
-        if plan:
-            title += _paint("2", f"  {plan}", tty)
+        if view.get("plan"):
+            title += _paint("2", f"  {view['plan']}", tty)
         lines = [title]
         if not view["windows"]:
             lines.append(f"  {view.get('error') or 'not signed in'}")
@@ -1134,18 +864,11 @@ def cli(argv: list[str] | None = None) -> int:
     tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     gauges, errors = collect(keys, max_age=CLI_MAX_AGE, parallel=True)
     views = source_views(gauges, errors, keys, collect_plans())
-    report = format_report(views, one, tty)
-    if not one:
-        running = format_sessions(running_sessions(), tty)
-        report = f"{report}\n{running}" if running else report
-    sys.stdout.write(report)
+    sys.stdout.write(format_report(views, one, tty))
     return report_status(views)
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--sessions"]:
-        sessions_main()
-        raise SystemExit(0)
     if running_as_cli(sys.argv):
         try:
             raise SystemExit(cli(sys.argv))
