@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds UsageBar and registers it as a launchd agent (starts at login, restarts if it dies).
+# Builds UsageBar and registers it as a launchd agent (starts at login, restarts if it crashes; Quit keeps it closed).
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LABEL="com.usagebar.app"
@@ -17,7 +17,7 @@ cat > "$PLIST" <<PLIST
   <key>ProgramArguments</key>
   <array><string>$DIR/UsageBar</string><string>$DIR/usage.py</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardErrorPath</key><string>/tmp/usagebar.err</string>
 </dict>
 </plist>
