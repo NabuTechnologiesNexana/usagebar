@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -212,6 +213,12 @@ def antigravity_cli_summary() -> dict:
     agy = find_binary("agy")
     if not agy:
         raise RuntimeError("agy nie je nainštalované")
+    # agy mistakes a failed token refresh while offline for a logged-out account and opens a
+    # Google login page in the browser - on every poll. Don't start it unless Google is reachable.
+    try:
+        socket.create_connection(("oauth2.googleapis.com", 443), timeout=3).close()
+    except OSError:
+        raise RuntimeError("bez pripojenia k Google, agy sa nespúšťa")
     try:
         r = subprocess.run([agy, "-p", "/usage", "--output-format", "json"],
                            capture_output=True, text=True, timeout=ANTIGRAVITY_TIMEOUT)
