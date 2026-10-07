@@ -33,7 +33,9 @@ Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatib
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import logging
 import os
 import re
 import shutil
@@ -63,6 +65,7 @@ ANTIGRAVITY_TIMEOUT = 40  # agy -p /usage takes 4-6 s warm, ~15 s cold
 CODEX_AUTH = Path.home() / ".codex/auth.json"
 GROK_AUTH = Path.home() / ".grok/auth.json"
 GROK_VERSION = Path.home() / ".grok/version.json"
+log = logging.getLogger("usagebar")
 GROK_PROXY = os.environ.get(
     "GROK_CLI_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com/v1"
 ).rstrip("/")
@@ -75,6 +78,8 @@ def parse_iso(value: str) -> datetime:
     """Python 3.9 fromisoformat rejects 'Z' and fractions that are not 3/6 digits."""
     value = value.replace("Z", "+00:00")
     m = re.match(r"(.*T\d\d:\d\d:\d\d)(?:\.(\d+))?(.*)$", value)
+    if m is None:
+        raise ValueError(f"not an ISO timestamp: {value!r}")
     frac = (m.group(2) or "0")[:6].ljust(6, "0")
     return datetime.fromisoformat(f"{m.group(1)}.{frac}{m.group(3)}")
 
@@ -108,7 +113,7 @@ def keychain(service: str, account: str | None = None) -> str | None:
         *(["-a", account] if account else []),
         "-w",
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -142,7 +147,7 @@ def gauge(
         "id": id_,
         "short": short,
         "label": label,
-        "percent": int(round(percent)),
+        "percent": round(percent),
         "reset": reset,
         "group": group,
         "fetched_at": now_iso(),
@@ -234,6 +239,7 @@ def antigravity_local_ports() -> list[int]:
         capture_output=True,
         text=True,
         timeout=10,
+        check=False,
     )
     ports, cmd = [], ""
     for line in r.stdout.splitlines():
@@ -263,10 +269,10 @@ def antigravity_local_summary() -> dict | None:
                     req, timeout=2, context=ssl._create_unverified_context()
                 ) as r:
                     data = json.load(r)
-                if "response" in data:
-                    return data["response"]
-            except Exception:
-                continue
+            except (OSError, http.client.HTTPException, ValueError):
+                continue  # not this port/scheme; the CLI path below is authoritative anyway
+            if isinstance(data, dict) and "response" in data:
+                return data["response"]
     return None
 
 
@@ -275,10 +281,15 @@ def antigravity_cli_summary() -> dict:
     if ANTIGRAVITY_CACHE.exists():
         try:
             cached = json.loads(ANTIGRAVITY_CACHE.read_text())
-            if now - cached.get("timestamp", 0) < ANTIGRAVITY_CACHE_TTL:
-                return cached["data"]
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            cached = None  # an unreadable cache only means asking agy again
+        stamp = cached.get("timestamp") if isinstance(cached, dict) else None
+        if (
+            isinstance(stamp, (int, float))
+            and now - stamp < ANTIGRAVITY_CACHE_TTL
+            and "data" in cached
+        ):
+            return cached["data"]
     agy = find_binary("agy")
     if not agy:
         raise RuntimeError("agy nie je nainštalované")
@@ -294,6 +305,7 @@ def antigravity_cli_summary() -> dict:
             capture_output=True,
             text=True,
             timeout=ANTIGRAVITY_TIMEOUT,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"agy neodpovedalo do {ANTIGRAVITY_TIMEOUT} s")
@@ -310,7 +322,7 @@ def antigravity_cli_summary() -> dict:
             ANTIGRAVITY_CACHE,
             {"timestamp": datetime.now(timezone.utc).timestamp(), "data": summary},
         )
-    except Exception:
+    except OSError:
         pass  # cache is an optimisation, never a reason to lose a good sample
     return summary
 
@@ -408,7 +420,7 @@ def codex_gauges() -> list[dict]:
         data = json.load(r)
     rate = data.get("rate_limit")
     if not isinstance(rate, dict):
-        raise RuntimeError("odpoveď bez rate_limit (zmenilo sa API?)")
+        raise TypeError("odpoveď bez rate_limit (zmenilo sa API?)")
     out = []
     for key in ("primary_window", "secondary_window"):
         win = rate.get(key)
@@ -416,7 +428,7 @@ def codex_gauges() -> list[dict]:
             continue
         used = win.get("used_percent")
         if not isinstance(used, (int, float)):
-            raise RuntimeError(f"{key} bez used_percent")
+            raise TypeError(f"{key} bez used_percent")
         seconds = win.get("limit_window_seconds") or 0
         window = (
             f"{round(seconds / 3600)} h"
@@ -484,11 +496,12 @@ class GrokAuthExpired(RuntimeError):
 
 def grok_client_version() -> str:
     try:
-        version = json.loads(GROK_VERSION.read_text()).get("version")
-        if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
-            return version
-    except Exception:
-        pass
+        data = json.loads(GROK_VERSION.read_text())
+    except (OSError, ValueError):
+        data = None  # fall back to asking the CLI itself
+    version = data.get("version") if isinstance(data, dict) else None
+    if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
+        return version
     grok = find_binary("grok")
     if not grok:
         return "0.0.0"
@@ -499,8 +512,9 @@ def grok_client_version() -> str:
             text=True,
             timeout=10,
             stdin=subprocess.DEVNULL,
+            check=False,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError, ValueError):
         return "0.0.0"
     m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
     return m.group(1) if m else "0.0.0"
@@ -509,10 +523,10 @@ def grok_client_version() -> str:
 def grok_load_auth() -> dict:
     try:
         data = json.loads(GROK_AUTH.read_text())
-    except Exception as e:
+    except (OSError, ValueError) as e:
         raise RuntimeError(f"auth.json sa nedá čítať ({type(e).__name__})")
     if not isinstance(data, dict):
-        raise RuntimeError("auth.json nemá očakávaný tvar")
+        raise TypeError("auth.json nemá očakávaný tvar")
     return data
 
 
@@ -538,7 +552,7 @@ def grok_token_fresh(entry: dict, skew_s: int = 120) -> bool:
         return True  # unknown expiry: try the token, refresh only after a 401
     try:
         return parse_iso(exp) > datetime.now(timezone.utc) + timedelta(seconds=skew_s)
-    except Exception:
+    except (ValueError, TypeError):  # TypeError: an offset-naive timestamp
         return True
 
 
@@ -559,6 +573,7 @@ def grok_refresh_login() -> None:
             text=True,
             timeout=40,
             stdin=subprocess.DEVNULL,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("grok models neodpovedalo do 40 s")
@@ -614,7 +629,7 @@ def grok_reset(value: object) -> str | None:
         return None
     try:
         parse_iso(value)
-    except Exception:
+    except ValueError:
         return None
     return value
 
@@ -624,14 +639,14 @@ def grok_credit_percent(config: dict) -> float | None:
     if "creditUsagePercent" in config and config["creditUsagePercent"] is not None:
         raw = config["creditUsagePercent"]
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            raise ValueError("creditUsagePercent nie je číslo")
+            raise TypeError("creditUsagePercent nie je číslo")
         return grok_percent(float(raw), "creditUsagePercent")
     products = config.get("productUsage")
     if products is not None and not isinstance(products, list):
-        raise ValueError("productUsage nie je zoznam")
+        raise TypeError("productUsage nie je zoznam")
     for item in products or []:
         if not isinstance(item, dict):
-            raise ValueError("productUsage má neznámy tvar")
+            raise TypeError("productUsage má neznámy tvar")
         name = str(item.get("product") or "").lower().replace("-", "").replace("_", "")
         if name not in ("grokbuild", "build"):
             continue
@@ -639,7 +654,7 @@ def grok_credit_percent(config: dict) -> float | None:
         if raw is None:
             continue
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            raise ValueError("productUsage.usagePercent nie je číslo")
+            raise TypeError("productUsage.usagePercent nie je číslo")
         return grok_percent(float(raw), "productUsage")
     period = config.get("currentPeriod")
     if isinstance(period, dict) and "WEEK" in str(period.get("type") or "").upper():
@@ -680,7 +695,7 @@ def grok_fetch(token: str, query: str) -> dict:
             raise GrokAuthExpired(f"billing HTTP {e.code}")
         raise RuntimeError(f"billing HTTP {e.code}")
     if not isinstance(payload, dict):
-        raise RuntimeError("billing nevrátilo objekt")
+        raise TypeError("billing nevrátilo objekt")
     return grok_config(payload)
 
 
@@ -799,6 +814,7 @@ def notify(gauges: list[dict]) -> None:
                     f'display notification "{msg}" with title "UsageBar" sound name "Glass"',
                 ],
                 timeout=10,
+                check=False,
             )
             seen[key] = True
     NOTIFIED_FILE.write_text(
@@ -833,11 +849,28 @@ _WINDOW_WORDS = (("týždeň", "week"), ("mesiac", "month"), ("5 h", "5h"))
 
 CLI_MAX_AGE = 300  # the menu refreshes on this cadence; reuse a sample that young
 
+# What a source (or the notifier) fails with in practice: network, TLS and subprocess
+# trouble, JSON that does not parse or does not have the shape we read, and the
+# Runtime/Value/TypeErrors the parsers raise on purpose. These become an error row and
+# the stale fallback. Anything else is a bug; it still must not take the other sources
+# down with it, so it gets the same treatment plus a traceback on stderr.
+SOURCE_ERRORS = (
+    OSError,  # includes urllib.error.URLError/HTTPError, socket timeouts, ssl.SSLError
+    http.client.HTTPException,
+    subprocess.SubprocessError,
+    ValueError,  # includes json.JSONDecodeError, UnicodeDecodeError
+    TypeError,
+    LookupError,
+    AttributeError,
+    ArithmeticError,
+    RuntimeError,
+)
+
 
 def _source_error(exc: Exception) -> str:
     return (
         str(exc)[:80]
-        if isinstance(exc, (RuntimeError, ValueError))
+        if isinstance(exc, (RuntimeError, ValueError, TypeError))
         else f"{type(exc).__name__}: {str(exc)[:70]}"
     )
 
@@ -851,7 +884,7 @@ def _sample_age(gauges: list[dict]) -> float | None:
             return None
         try:
             ages.append((now - parse_iso(raw)).total_seconds())
-        except Exception:
+        except (ValueError, TypeError):  # TypeError: an offset-naive timestamp
             return None
     return max(ages) if ages else None
 
@@ -859,7 +892,10 @@ def _sample_age(gauges: list[dict]) -> float | None:
 def _fetch_one(name: str) -> tuple[str, list[dict] | None, str | None]:
     try:
         return name, SOURCE_FUNCS[name](), None
+    except SOURCE_ERRORS as exc:
+        return name, None, _source_error(exc)
     except Exception as exc:
+        log.exception("source %s failed unexpectedly", name)
         return name, None, _source_error(exc)
 
 
@@ -901,7 +937,7 @@ def collect(
     names = list(SOURCE_FUNCS) if which is None else which
     try:
         last_ok = json.loads(LAST_OK_FILE.read_text()) if LAST_OK_FILE.exists() else {}
-    except Exception:
+    except (OSError, ValueError):
         last_ok = {}
     if not isinstance(last_ok, dict):
         last_ok = {}
@@ -926,8 +962,8 @@ def collect(
         gauges += fresh
         try:
             write_private(LAST_OK_FILE, last_ok)
-        except Exception:
-            pass
+        except OSError:
+            pass  # the gauges are already in hand; only the next stale fallback is lost
     return gauges, errors
 
 
@@ -935,7 +971,10 @@ def main() -> None:
     gauges, errors = collect()
     try:
         notify([g for g in gauges if not g["stale"]])
+    except SOURCE_ERRORS as e:
+        errors.append(f"notify: {e}")
     except Exception as e:
+        log.exception("notify failed unexpectedly")
         errors.append(f"notify: {e}")
     print(
         json.dumps(
@@ -1111,7 +1150,7 @@ if __name__ == "__main__":
         except BrokenPipeError:
             try:
                 sys.stdout.close()
-            except Exception:
-                pass
+            except OSError:
+                pass  # the reader is gone; the unflushed rest has nowhere to go
             raise SystemExit(0)
     main()
