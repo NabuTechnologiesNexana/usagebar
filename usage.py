@@ -472,7 +472,7 @@ def collect_plans() -> dict[str, str]:
     for name, fn in PLAN_FUNCS.items():
         try:
             plan = fn()
-        except Exception:
+        except SOURCE_ERRORS:
             plan = None
         if plan:
             out[name] = plan
