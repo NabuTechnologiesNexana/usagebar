@@ -29,6 +29,7 @@ so the bar keeps showing real numbers instead of dropping the section or inventi
 Sends one macOS notification per limit per reset window when it crosses NOTIFY_AT.
 Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatible.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -46,20 +47,29 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("USAGEBAR_STATE", Path.home() / "Library/Application Support/UsageBar"))
+STATE_DIR = Path(
+    os.environ.get(
+        "USAGEBAR_STATE", Path.home() / "Library/Application Support/UsageBar"
+    )
+)
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
 LAST_OK_FILE = STATE_DIR / "last_ok.json"
 ANTIGRAVITY_CACHE = STATE_DIR / "antigravity_cache.json"
-ANTIGRAVITY_CACHE_TTL = 120  # a manual "Obnoviť" right after the timer should not spawn agy again
+ANTIGRAVITY_CACHE_TTL = (
+    120  # a manual "Obnoviť" right after the timer should not spawn agy again
+)
 ANTIGRAVITY_TIMEOUT = 40  # agy -p /usage takes 4-6 s warm, ~15 s cold
 CODEX_AUTH = Path.home() / ".codex/auth.json"
 GROK_AUTH = Path.home() / ".grok/auth.json"
 GROK_VERSION = Path.home() / ".grok/version.json"
-GROK_PROXY = os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com/v1").rstrip("/")
+GROK_PROXY = os.environ.get(
+    "GROK_CLI_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com/v1"
+).rstrip("/")
 
 
 # --- helpers -----------------------------------------------------------------
+
 
 def parse_iso(value: str) -> datetime:
     """Python 3.9 fromisoformat rejects 'Z' and fractions that are not 3/6 digits."""
@@ -75,8 +85,14 @@ def find_binary(name: str) -> str | None:
     found = shutil.which(name)
     if found:
         return found
-    for directory in ("/opt/homebrew/bin", "/usr/local/bin", Path.home() / ".local/bin",
-                      Path.home() / "bin", "/usr/sbin", "/sbin"):
+    for directory in (
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        Path.home() / ".local/bin",
+        Path.home() / "bin",
+        "/usr/sbin",
+        "/sbin",
+    ):
         candidate = Path(directory) / name
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
@@ -84,13 +100,22 @@ def find_binary(name: str) -> str | None:
 
 
 def keychain(service: str, account: str | None = None) -> str | None:
-    cmd = ["security", "find-generic-password", "-s", service, *(["-a", account] if account else []), "-w"]
+    cmd = [
+        "security",
+        "find-generic-password",
+        "-s",
+        service,
+        *(["-a", account] if account else []),
+        "-w",
+    ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
 def http_json(url: str, headers: dict, body: bytes | None = None) -> dict:
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", **headers})
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json", **headers}
+    )
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.load(r)
 
@@ -99,7 +124,9 @@ def write_private(path: Path, payload: dict) -> None:
     """0600 from the first byte (chmod after write_text leaves a window with default perms)."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    with os.fdopen(
+        os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w"
+    ) as f:
         json.dump(payload, f)
     os.replace(tmp, path)
 
@@ -108,20 +135,33 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def gauge(id_: str, short: str, label: str, percent: float, reset: str | None, group: str) -> dict:
-    return {"id": id_, "short": short, "label": label, "percent": int(round(percent)), "reset": reset, "group": group,
-            "fetched_at": now_iso(), "stale": False}
+def gauge(
+    id_: str, short: str, label: str, percent: float, reset: str | None, group: str
+) -> dict:
+    return {
+        "id": id_,
+        "short": short,
+        "label": label,
+        "percent": int(round(percent)),
+        "reset": reset,
+        "group": group,
+        "fetched_at": now_iso(),
+        "stale": False,
+    }
 
 
 # --- Claude ------------------------------------------------------------------
+
 
 def claude_gauges() -> list[dict]:
     raw = keychain("Claude Code-credentials")
     if not raw:
         return []
     token = json.loads(raw)["claudeAiOauth"]["accessToken"]
-    data = http_json("https://api.anthropic.com/api/oauth/usage",
-                     {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+    data = http_json(
+        "https://api.anthropic.com/api/oauth/usage",
+        {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
+    )
     out = []
     for lim in data["limits"]:
         kind = lim["kind"]
@@ -130,16 +170,27 @@ def claude_gauges() -> list[dict]:
         elif kind == "weekly_all":
             short, label = "W", "Claude · týždeň"
         elif kind == "weekly_scoped":
-            model = ((lim.get("scope") or {}).get("model") or {}).get("display_name", "?")
+            model = ((lim.get("scope") or {}).get("model") or {}).get(
+                "display_name", "?"
+            )
             short, label = model[:1], f"Claude · týždeň {model}"
         else:
             continue
-        id_ = f"claude:{kind}:{model}" if kind == "weekly_scoped" else f"claude:{kind}"  # scoped gauges must not share a notification key
+        id_ = (
+            f"claude:{kind}:{model}" if kind == "weekly_scoped" else f"claude:{kind}"
+        )  # scoped gauges must not share a notification key
         out.append(gauge(id_, short, label, lim["percent"], lim["resets_at"], "claude"))
     return out
 
 
-CLAUDE_TIERS = {"max_5x": "Max 5×", "max_20x": "Max 20×", "max": "Max", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}
+CLAUDE_TIERS = {
+    "max_5x": "Max 5×",
+    "max_20x": "Max 20×",
+    "max": "Max",
+    "pro": "Pro",
+    "team": "Team",
+    "enterprise": "Enterprise",
+}
 
 
 def claude_plan() -> str | None:
@@ -164,8 +215,13 @@ def claude_plan() -> str | None:
 # The Cloud Code endpoint (cloudcode-pa.googleapis.com retrieveUserQuotaSummary) is NOT
 # used any more: it answers with remainingFraction 1 for every bucket, i.e. a fake 0 %.
 
-ANTIGRAVITY_RPC = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-ANTIGRAVITY_GROUPS = {"Gemini Models": "Gemini", "Claude and GPT models": "Other models"}
+ANTIGRAVITY_RPC = (
+    "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+)
+ANTIGRAVITY_GROUPS = {
+    "Gemini Models": "Gemini",
+    "Claude and GPT models": "Other models",
+}
 ANTIGRAVITY_WINDOWS = {"5h": "5 h", "weekly": "týždeň"}
 
 
@@ -173,12 +229,19 @@ def antigravity_local_ports() -> list[int]:
     lsof = find_binary("lsof")
     if not lsof:
         return []
-    r = subprocess.run([lsof, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"], capture_output=True, text=True, timeout=10)
+    r = subprocess.run(
+        [lsof, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     ports, cmd = [], ""
     for line in r.stdout.splitlines():
         if line.startswith("c"):
             cmd = line[1:].lower()
-        elif line.startswith("n127.0.0.1:") and ("agy" in cmd or "language_server" in cmd or "antigravity" in cmd):
+        elif line.startswith("n127.0.0.1:") and (
+            "agy" in cmd or "language_server" in cmd or "antigravity" in cmd
+        ):
             ports.append(int(line.rsplit(":", 1)[1]))
     return sorted(set(ports))
 
@@ -191,8 +254,14 @@ def antigravity_local_summary() -> dict | None:
     for port in antigravity_local_ports():
         for scheme in ("http", "https"):
             try:
-                req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}{ANTIGRAVITY_RPC}", data=b"{}", headers=headers)
-                with urllib.request.urlopen(req, timeout=2, context=ssl._create_unverified_context()) as r:
+                req = urllib.request.Request(
+                    f"{scheme}://127.0.0.1:{port}{ANTIGRAVITY_RPC}",
+                    data=b"{}",
+                    headers=headers,
+                )
+                with urllib.request.urlopen(
+                    req, timeout=2, context=ssl._create_unverified_context()
+                ) as r:
                     data = json.load(r)
                 if "response" in data:
                     return data["response"]
@@ -220,22 +289,35 @@ def antigravity_cli_summary() -> dict:
     except OSError:
         raise RuntimeError("bez pripojenia k Google, agy sa nespúšťa")
     try:
-        r = subprocess.run([agy, "-p", "/usage", "--output-format", "json"],
-                           capture_output=True, text=True, timeout=ANTIGRAVITY_TIMEOUT)
+        r = subprocess.run(
+            [agy, "-p", "/usage", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=ANTIGRAVITY_TIMEOUT,
+        )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"agy neodpovedalo do {ANTIGRAVITY_TIMEOUT} s")
     if r.returncode != 0:
-        raise RuntimeError(f"agy skončilo s kódom {r.returncode}: {(r.stderr or r.stdout).strip()[:60]}")
+        raise RuntimeError(
+            f"agy skončilo s kódom {r.returncode}: {(r.stderr or r.stdout).strip()[:60]}"
+        )
     summary = json.loads(r.stdout).get("command", {}).get("data")
-    antigravity_buckets(summary)  # validate before caching, so a broken shape is never served from cache
+    antigravity_buckets(
+        summary
+    )  # validate before caching, so a broken shape is never served from cache
     try:
-        write_private(ANTIGRAVITY_CACHE, {"timestamp": datetime.now(timezone.utc).timestamp(), "data": summary})
+        write_private(
+            ANTIGRAVITY_CACHE,
+            {"timestamp": datetime.now(timezone.utc).timestamp(), "data": summary},
+        )
     except Exception:
         pass  # cache is an optimisation, never a reason to lose a good sample
     return summary
 
 
-def antigravity_buckets(summary: dict | None) -> list[tuple[str, str, str, float, str | None]]:
+def antigravity_buckets(
+    summary: dict | None,
+) -> list[tuple[str, str, str, float, str | None]]:
     """(group name, bucket id, window key, remaining fraction, reset) - raises on anything unexpected,
     so a renamed field surfaces as a ⚠ row instead of a silent 0 %."""
     groups = (summary or {}).get("groups")
@@ -243,9 +325,13 @@ def antigravity_buckets(summary: dict | None) -> list[tuple[str, str, str, float
         raise ValueError("odpoveď bez groups")
     out = []
     for group in groups:
-        name = ANTIGRAVITY_GROUPS.get(group.get("displayName") or group.get("name") or "", None)
+        name = ANTIGRAVITY_GROUPS.get(
+            group.get("displayName") or group.get("name") or "", None
+        )
         if name is None:
-            raise ValueError(f"neznáma skupina {group.get('displayName') or group.get('name')!r}")
+            raise ValueError(
+                f"neznáma skupina {group.get('displayName') or group.get('name')!r}"
+            )
         buckets = group.get("buckets")
         if not buckets:
             raise ValueError(f"skupina {name} bez buckets")
@@ -253,19 +339,44 @@ def antigravity_buckets(summary: dict | None) -> list[tuple[str, str, str, float
             bid = b.get("bucketId") or b.get("id")
             rem = b.get("remainingFraction", b.get("remaining_fraction"))
             window = b.get("window")
-            if not bid or not isinstance(rem, (int, float)) or not 0 <= rem <= 1 or window not in ANTIGRAVITY_WINDOWS:
-                raise ValueError(f"neplatný bucket {bid!r}: rem={rem!r} window={window!r}")
-            out.append((name, bid, window, float(rem), b.get("resetTime") or b.get("reset_time")))
+            if (
+                not bid
+                or not isinstance(rem, (int, float))
+                or not 0 <= rem <= 1
+                or window not in ANTIGRAVITY_WINDOWS
+            ):
+                raise ValueError(
+                    f"neplatný bucket {bid!r}: rem={rem!r} window={window!r}"
+                )
+            out.append(
+                (
+                    name,
+                    bid,
+                    window,
+                    float(rem),
+                    b.get("resetTime") or b.get("reset_time"),
+                )
+            )
     return out
 
 
 def gemini_gauges() -> list[dict]:
     summary = antigravity_local_summary() or antigravity_cli_summary()
     out = []
-    rows = sorted(antigravity_buckets(summary), key=lambda t: (t[0] != "Gemini", t[2] != "5h"))  # Gemini group first, 5h first
+    rows = sorted(
+        antigravity_buckets(summary), key=lambda t: (t[0] != "Gemini", t[2] != "5h")
+    )  # Gemini group first, 5h first
     for name, bid, window, rem, reset in rows:
-        out.append(gauge(f"antigravity:{bid}", "G" if name == "Gemini" else "A", f"{name} · {ANTIGRAVITY_WINDOWS[window]}",
-                         (1 - rem) * 100, reset, "gemini"))
+        out.append(
+            gauge(
+                f"antigravity:{bid}",
+                "G" if name == "Gemini" else "A",
+                f"{name} · {ANTIGRAVITY_WINDOWS[window]}",
+                (1 - rem) * 100,
+                reset,
+                "gemini",
+            )
+        )
     return out
 
 
@@ -275,16 +386,24 @@ def gemini_gauges() -> list[dict]:
 # used_percent, reset_at epoch, limit_window_seconds). Not exercised against a live
 # Codex account yet - if it breaks, the row shows as a warning in the menu.
 
+
 def codex_gauges() -> list[dict]:
-    if not CODEX_AUTH.exists() or not find_binary("codex"):  # stale auth.json without the CLI is common
+    if not CODEX_AUTH.exists() or not find_binary(
+        "codex"
+    ):  # stale auth.json without the CLI is common
         return []
     tokens = json.loads(CODEX_AUTH.read_text()).get("tokens") or {}
     if not tokens.get("access_token"):
         return []
-    headers = {"Authorization": f"Bearer {tokens['access_token']}", "User-Agent": "UsageBar"}
+    headers = {
+        "Authorization": f"Bearer {tokens['access_token']}",
+        "User-Agent": "UsageBar",
+    }
     if tokens.get("account_id"):
         headers["ChatGPT-Account-Id"] = tokens["account_id"]
-    req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
+    req = urllib.request.Request(
+        "https://chatgpt.com/backend-api/wham/usage", headers=headers
+    )
     with urllib.request.urlopen(req, timeout=20) as r:
         data = json.load(r)
     rate = data.get("rate_limit")
@@ -299,11 +418,17 @@ def codex_gauges() -> list[dict]:
         if not isinstance(used, (int, float)):
             raise RuntimeError(f"{key} bez used_percent")
         seconds = win.get("limit_window_seconds") or 0
-        window = f"{round(seconds / 3600)} h" if seconds and seconds < 48 * 3600 else "týždeň"
+        window = (
+            f"{round(seconds / 3600)} h"
+            if seconds and seconds < 48 * 3600
+            else "týždeň"
+        )
         reset = win.get("reset_at")
         if isinstance(reset, (int, float)):
             reset = datetime.fromtimestamp(reset, timezone.utc).isoformat()
-        out.append(gauge(f"codex:{key}", "X", f"Codex · {window}", used, reset, "codex"))
+        out.append(
+            gauge(f"codex:{key}", "X", f"Codex · {window}", used, reset, "codex")
+        )
     if not out:
         raise RuntimeError("rate_limit bez okien (účet bez limitov?)")
     return out
@@ -317,6 +442,7 @@ def codex_plan() -> str | None:
     if not isinstance(token, str) or token.count(".") != 2:
         return None
     import base64
+
     payload = token.split(".")[1]
     claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     plan = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")
@@ -341,7 +467,6 @@ def collect_plans() -> dict[str, str]:
     return out
 
 
-
 # --- Grok ---------------------------------------------------------------------
 # Same numbers the Grok CLI /usage modal shows. The weekly credit percent comes from
 # GET {cli-chat-proxy}/billing?format=credits; the monthly dollar allowance from
@@ -351,6 +476,7 @@ def collect_plans() -> dict[str, str]:
 # `grok models`, which is the CLI's own refresh — refresh-token rotation stays
 # inside grok, so a collector can never invalidate the login.
 # An API-key login has no subscription windows and is skipped, same as Codex.
+
 
 class GrokAuthExpired(RuntimeError):
     pass
@@ -367,7 +493,13 @@ def grok_client_version() -> str:
     if not grok:
         return "0.0.0"
     try:
-        r = subprocess.run([grok, "--version"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        r = subprocess.run(
+            [grok, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
     except Exception:
         return "0.0.0"
     m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
@@ -421,7 +553,13 @@ def grok_refresh_login() -> None:
     if not grok:
         raise RuntimeError("grok nie je nainštalované")
     try:
-        r = subprocess.run([grok, "models"], capture_output=True, text=True, timeout=40, stdin=subprocess.DEVNULL)
+        r = subprocess.run(
+            [grok, "models"],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired:
         raise RuntimeError("grok models neodpovedalo do 40 s")
     if r.returncode != 0:
@@ -513,21 +651,27 @@ def grok_config(payload: dict) -> dict:
     config = payload.get("config")
     if isinstance(config, dict):
         return config
-    if any(k in payload for k in ("creditUsagePercent", "monthlyLimit", "currentPeriod", "productUsage")):
+    if any(
+        k in payload
+        for k in ("creditUsagePercent", "monthlyLimit", "currentPeriod", "productUsage")
+    ):
         return payload
     raise RuntimeError("odpoveď bez config (zmenilo sa API?)")
 
 
 def grok_fetch(token: str, query: str) -> dict:
     version = grok_client_version()
-    req = urllib.request.Request(f"{GROK_PROXY}/billing{query}", headers={
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-        "X-XAI-Token-Auth": "xai-grok-cli",
-        "x-grok-client-version": version,
-        "x-grok-client-identifier": "grok-shell",
-        "User-Agent": f"grok-cli/{version}",
-    })
+    req = urllib.request.Request(
+        f"{GROK_PROXY}/billing{query}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "X-XAI-Token-Auth": "xai-grok-cli",
+            "x-grok-client-version": version,
+            "x-grok-client-identifier": "grok-shell",
+            "User-Agent": f"grok-cli/{version}",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             payload = json.load(r)
@@ -540,23 +684,44 @@ def grok_fetch(token: str, query: str) -> dict:
     return grok_config(payload)
 
 
-def grok_windows(weekly: dict, monthly: dict | None) -> list[tuple[str, str, str, float, str | None]]:
+def grok_windows(
+    weekly: dict, monthly: dict | None
+) -> list[tuple[str, str, str, float, str | None]]:
     """(id, short, label, percent, reset). Raises on a shape that would otherwise draw a fake 0 %."""
     out = []
-    period = weekly.get("currentPeriod") if isinstance(weekly.get("currentPeriod"), dict) else {}
+    period = (
+        weekly.get("currentPeriod")
+        if isinstance(weekly.get("currentPeriod"), dict)
+        else {}
+    )
     kind = str(period.get("type") or "")
     credits_monthly = "MONTH" in kind.upper() and "WEEK" not in kind.upper()
     credit = grok_credit_percent(weekly)
     if credit is not None:
         label = "Grok · mesiac" if credits_monthly else "Grok · týždeň"
-        out.append(("grok:weekly", "K", label, credit,
-                    grok_reset(period.get("end")) or grok_reset(weekly.get("billingPeriodEnd"))))
+        out.append(
+            (
+                "grok:weekly",
+                "K",
+                label,
+                credit,
+                grok_reset(period.get("end"))
+                or grok_reset(weekly.get("billingPeriodEnd")),
+            )
+        )
     if not credits_monthly and monthly:
         limit = grok_optional_money(monthly, "monthlyLimit")
         used = grok_optional_money(monthly, "used")
         if limit is not None and limit > 0 and used is not None:
-            out.append(("grok:monthly", "K", "Grok · mesiac", grok_percent(used / limit * 100, "monthly"),
-                        grok_reset(monthly.get("billingPeriodEnd"))))
+            out.append(
+                (
+                    "grok:monthly",
+                    "K",
+                    "Grok · mesiac",
+                    grok_percent(used / limit * 100, "monthly"),
+                    grok_reset(monthly.get("billingPeriodEnd")),
+                )
+            )
         elif limit is not None and limit > 0 and used is None:
             raise ValueError("monthlyLimit bez used")
     # Pay-as-you-go rides the credits payload; the monthly payload is only a fallback.
@@ -568,8 +733,18 @@ def grok_windows(weekly: dict, monthly: dict | None) -> list[tuple[str, str, str
         spent = grok_optional_money(monthly, "onDemandUsed")
         reset_source = monthly
     if cap is not None and cap > 0 and spent is not None:
-        reset = grok_reset(reset_source.get("billingPeriodEnd")) or grok_reset(period.get("end"))
-        out.append(("grok:ondemand", "K", "Grok · pay-as-you-go", grok_percent(spent / cap * 100, "onDemand"), reset))
+        reset = grok_reset(reset_source.get("billingPeriodEnd")) or grok_reset(
+            period.get("end")
+        )
+        out.append(
+            (
+                "grok:ondemand",
+                "K",
+                "Grok · pay-as-you-go",
+                grok_percent(spent / cap * 100, "onDemand"),
+                reset,
+            )
+        )
     elif cap is not None and cap > 0 and spent is None:
         raise ValueError("onDemandCap bez onDemandUsed")
     if not out:
@@ -583,6 +758,7 @@ def grok_gauges() -> list[dict]:
     token = grok_access_token()
     if not token:
         return []
+
     def pair(tok: str) -> tuple[dict, dict | None]:
         weekly_cfg = grok_fetch(tok, "?format=credits")
         try:
@@ -607,6 +783,7 @@ def grok_gauges() -> list[dict]:
 
 # --- notifications ------------------------------------------------------------
 
+
 def notify(gauges: list[dict]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     seen = json.loads(NOTIFIED_FILE.read_text()) if NOTIFIED_FILE.exists() else {}
@@ -615,9 +792,18 @@ def notify(gauges: list[dict]) -> None:
         key = f"{g['id']}@{(g['reset'] or '')[:16]}"  # one notification per limit per reset window (minute precision)
         if g["percent"] >= NOTIFY_AT and key not in seen:
             msg = f"{g['label']}: {g['percent']} %"
-            subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "UsageBar" sound name "Glass"'], timeout=10)
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "{msg}" with title "UsageBar" sound name "Glass"',
+                ],
+                timeout=10,
+            )
             seen[key] = True
-    NOTIFIED_FILE.write_text(json.dumps({k: v for k, v in seen.items() if k.split("@", 1)[1] > now_key}))
+    NOTIFIED_FILE.write_text(
+        json.dumps({k: v for k, v in seen.items() if k.split("@", 1)[1] > now_key})
+    )
 
 
 # Internal keys match the gauge "group" and the last_ok file. The CLI says
@@ -649,7 +835,11 @@ CLI_MAX_AGE = 300  # the menu refreshes on this cadence; reuse a sample that you
 
 
 def _source_error(exc: Exception) -> str:
-    return str(exc)[:80] if isinstance(exc, (RuntimeError, ValueError)) else f"{type(exc).__name__}: {str(exc)[:70]}"
+    return (
+        str(exc)[:80]
+        if isinstance(exc, (RuntimeError, ValueError))
+        else f"{type(exc).__name__}: {str(exc)[:70]}"
+    )
 
 
 def _sample_age(gauges: list[dict]) -> float | None:
@@ -673,7 +863,9 @@ def _fetch_one(name: str) -> tuple[str, list[dict] | None, str | None]:
         return name, None, _source_error(exc)
 
 
-def _fetch(names: list[str], last_ok: dict, parallel: bool) -> tuple[list[dict], list[str]]:
+def _fetch(
+    names: list[str], last_ok: dict, parallel: bool
+) -> tuple[list[dict], list[str]]:
     if parallel and len(names) > 1:
         with ThreadPoolExecutor(max_workers=len(names)) as pool:
             results = list(pool.map(_fetch_one, names))
@@ -697,7 +889,9 @@ def _fetch(names: list[str], last_ok: dict, parallel: bool) -> tuple[list[dict],
     return gauges, errors
 
 
-def collect(which: list[str] | None = None, max_age: float | None = None, parallel: bool = False) -> tuple[list[dict], list[str]]:
+def collect(
+    which: list[str] | None = None, max_age: float | None = None, parallel: bool = False
+) -> tuple[list[dict], list[str]]:
     """Fresh gauges plus the same stale fallback the menubar uses. Does not notify.
 
     The menubar calls this with no extra arguments, so it still fetches every source,
@@ -716,7 +910,13 @@ def collect(which: list[str] | None = None, max_age: float | None = None, parall
     for name in names:
         cached = last_ok.get(name) or []
         age = _sample_age(cached) if isinstance(cached, list) and cached else None
-        if max_age is not None and isinstance(cached, list) and cached and age is not None and age <= max_age:
+        if (
+            max_age is not None
+            and isinstance(cached, list)
+            and cached
+            and age is not None
+            and age <= max_age
+        ):
             gauges += cached
         else:
             needed.append(name)
@@ -737,14 +937,24 @@ def main() -> None:
         notify([g for g in gauges if not g["stale"]])
     except Exception as e:
         errors.append(f"notify: {e}")
-    print(json.dumps({"gauges": gauges, "errors": errors, "plans": collect_plans()}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {"gauges": gauges, "errors": errors, "plans": collect_plans()},
+            ensure_ascii=False,
+        )
+    )
 
 
 # --- CLI ----------------------------------------------------------------------
 # Every window, grouped by account. The percent is how much of that limit is used.
 
 MARKS = {"claude": "✳", "gemini": "✦", "codex": "⚛", "grok": "✕"}
-NAME_COLOR = {"claude": "38;2;204;120;92", "gemini": "38;2;87;140;245", "codex": "38;2;115;184;161", "grok": "1"}
+NAME_COLOR = {
+    "claude": "38;2;204;120;92",
+    "gemini": "38;2;87;140;245",
+    "codex": "38;2;115;184;161",
+    "grok": "1",
+}
 BAR_WIDTH = 20
 _EIGHTH = "▏▎▍▌▋▊▉"
 
@@ -769,15 +979,23 @@ def _errors_by_source(errors: list[str]) -> dict[str, str]:
     return out
 
 
-def source_views(gauges: list[dict], errors: list[str], keys: list[str], plans: dict | None = None) -> list[dict]:
+def source_views(
+    gauges: list[dict], errors: list[str], keys: list[str], plans: dict | None = None
+) -> list[dict]:
     why = _errors_by_source(errors)
     views = []
     for key in keys:
         mine = [g for g in gauges if g.get("group") == key]
-        views.append({
-            "key": key, "name": SOURCE_NAME[key], "windows": mine, "plan": (plans or {}).get(key),
-            "error": why.get(key), "missing": not mine and key not in why,
-        })
+        views.append(
+            {
+                "key": key,
+                "name": SOURCE_NAME[key],
+                "windows": mine,
+                "plan": (plans or {}).get(key),
+                "error": why.get(key),
+                "missing": not mine and key not in why,
+            }
+        )
     return views
 
 
@@ -825,10 +1043,16 @@ def _blocks(views: list[dict], tty: bool, show_empty: bool) -> str:
             chosen.append(view)
     if not chosen:
         return ""
-    width = max([len(window_name(g)) for view in chosen for g in view["windows"]], default=0)
+    width = max(
+        [len(window_name(g)) for view in chosen for g in view["windows"]], default=0
+    )
     blocks = []
     for view in chosen:
-        title = _paint(NAME_COLOR.get(view["key"], "1"), f"{MARKS.get(view['key'], '•')} {view['name']}", tty)
+        title = _paint(
+            NAME_COLOR.get(view["key"], "1"),
+            f"{MARKS.get(view['key'], '•')} {view['name']}",
+            tty,
+        )
         if view.get("plan"):
             title += _paint("2", f"  {view['plan']}", tty)
         lines = [title]
@@ -858,7 +1082,10 @@ def running_as_cli(argv: list[str]) -> bool:
 
 def cli(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
-    parser = argparse.ArgumentParser(prog="usagebar", description="Show how much of each AI subscription limit is used.")
+    parser = argparse.ArgumentParser(
+        prog="usagebar",
+        description="Show how much of each AI subscription limit is used.",
+    )
     parser.add_argument("source", nargs="?", help="antigravity, grok, codex, or claude")
     args = parser.parse_args(argv[1:])
     if args.source is None:
@@ -866,7 +1093,9 @@ def cli(argv: list[str] | None = None) -> int:
     else:
         key = CLI_SOURCES.get(args.source.lower())
         if key is None:
-            parser.error(f"unknown source {args.source!r}; choose antigravity, grok, codex, or claude")
+            parser.error(
+                f"unknown source {args.source!r}; choose antigravity, grok, codex, or claude"
+            )
         keys, one = [key], True
     tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     gauges, errors = collect(keys, max_age=CLI_MAX_AGE, parallel=True)
