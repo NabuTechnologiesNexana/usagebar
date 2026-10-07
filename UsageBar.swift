@@ -15,18 +15,9 @@ struct Payload: Decodable { let gauges: [Gauge]; let errors: [String]; let plans
 let scriptPath = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("usage.py").path
-let groupOrder = ["claude", "gemini", "codex", "grok"]
 let headline = ["claude:session", "antigravity:gemini-5h", "codex:primary_window", "grok:weekly"]  // menubar = the current window per vendor
 let refreshSeconds: TimeInterval = 300
 let groupTitles = ["claude": "CLAUDE", "gemini": "GEMINI (Antigravity)", "codex": "CODEX", "grok": "GROK"]
-let groupNames = ["claude": "Claude", "gemini": "Gemini", "codex": "Codex", "grok": "Grok"]
-
-// The gauge that limits work in a vendor right now: the fullest window. For Antigravity only the
-// Gemini group counts (the Claude/GPT-through-Antigravity quota is a separate pool).
-func limiting(_ gauges: [Gauge], _ group: String) -> Gauge? {
-    gauges.filter { $0.group == group && ($0.group != "gemini" || $0.id.hasPrefix("antigravity:gemini")) }
-          .max { $0.percent < $1.percent }
-}
 
 func color(_ p: Int) -> NSColor {
     p >= 80 ? .systemRed : p >= 50 ? .systemOrange : .systemGreen
@@ -238,42 +229,20 @@ final class Bar: NSView {
 }
 
 final class SectionHeader: NSView {
-    init(title: String, group: String?, status: String = "", plan: String? = nil) {
+    init(title: String, group: String, status: String = "", plan: String? = nil) {
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
-        if let group = group {
-            let icon = NSImageView(frame: NSRect(x: 18, y: 6, width: 13, height: 13))
-            icon.image = vendorGlyph(group, size: 13); addSubview(icon)
-        }
+        let icon = NSImageView(frame: NSRect(x: 18, y: 6, width: 13, height: 13))
+        icon.image = vendorGlyph(group, size: 13); addSubview(icon)
         let label = NSTextField(labelWithString: title.uppercased())
-        label.frame = NSRect(x: group == nil ? 18 : 37, y: 5, width: 180, height: 15)
+        label.frame = NSRect(x: 37, y: 5, width: 180, height: 15)
         label.font = .systemFont(ofSize: 10, weight: .semibold)
-        label.textColor = group.map(vendorColor) ?? .secondaryLabelColor
+        label.textColor = vendorColor(group)
         // right side: the stale warning when there is one, otherwise the subscription name (Max 5×, Plus)
         let right = NSTextField(labelWithString: status.isEmpty ? (plan ?? "") : status)
         right.frame = NSRect(x: 160, y: 5, width: 142, height: 15); right.alignment = .right
         right.font = .systemFont(ofSize: 10, weight: status.isEmpty ? .semibold : .regular)
         right.textColor = status.isEmpty ? .secondaryLabelColor : .systemOrange
         [label, right].forEach(addSubview)
-    }
-    required init?(coder: NSCoder) { nil }
-}
-
-// One line per vendor, most headroom first: which tool to hand the next task to.
-final class SwitchRow: NSView {
-    init(rank: Int, group: String, g: Gauge?) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 34))
-        let icon = NSImageView(frame: NSRect(x: 18, y: 12, width: 13, height: 13))
-        icon.image = vendorGlyph(group, size: 13, tint: g == nil ? .tertiaryLabelColor : nil)
-        let name = NSTextField(labelWithString: "\(rank). \(groupNames[group] ?? group)")
-        name.frame = NSRect(x: 37, y: 15, width: 150, height: 16); name.font = .systemFont(ofSize: 12, weight: rank == 1 ? .semibold : .regular)
-        let free = NSTextField(labelWithString: g.map { "\(100 - $0.percent) % voľné" } ?? "bez dát")
-        free.frame = NSRect(x: 190, y: 15, width: 112, height: 16); free.alignment = .right
-        free.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        free.textColor = g.map { color($0.percent) } ?? .tertiaryLabelColor
-        let sub = NSTextField(labelWithString: g.map { "limituje \($0.window) · \(resetText($0.reset))" } ?? "zdroj zlyhal, pozri nižšie")
-        sub.frame = NSRect(x: 37, y: 2, width: 265, height: 13); sub.font = .systemFont(ofSize: 10); sub.textColor = .tertiaryLabelColor
-        if g == nil { name.textColor = .tertiaryLabelColor }
-        [icon, name, free, sub].forEach(addSubview)
     }
     required init?(coder: NSCoder) { nil }
 }
@@ -336,8 +305,6 @@ final class App: NSObject, NSApplicationDelegate {
     func render(_ payload: Payload?, _ extraErrors: [String]) {
         let gauges = payload?.gauges ?? []
         let plans = payload?.plans ?? [:]
-        let ranked = groupOrder.map { ($0, limiting(gauges, $0)) }
-            .sorted { a, b in (a.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) > (b.1.map { $0.isStale ? -1 : 100 - $0.percent } ?? -2) }
 
         let image = menuBarImage(gauges)
         item.button?.attributedTitle = NSAttributedString(string: "")
@@ -350,13 +317,6 @@ final class App: NSObject, NSApplicationDelegate {
         item.length = image.size.width + 14
 
         menu.removeAllItems()
-        if ranked.contains(where: { $0.1 != nil }) {
-            let h = NSMenuItem(); h.isEnabled = false; h.view = SectionHeader(title: "Kam prepnúť teraz", group: nil); menu.addItem(h)
-            for (i, (group, g)) in ranked.enumerated() {
-                let mi = NSMenuItem(); mi.view = SwitchRow(rank: i + 1, group: group, g: g.flatMap { $0.isStale ? nil : $0 }); menu.addItem(mi)
-            }
-            menu.addItem(.separator())
-        }
         var lastGroup = ""
         for g in gauges {
             if g.group != lastGroup {

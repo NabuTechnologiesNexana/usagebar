@@ -11,8 +11,7 @@ No dependencies: one Python script (system `/usr/bin/python3`) + one Swift file 
 ✳ 29%   ✦ 0%   ⚛ 6%   ✕ 12%   ← menubar: vendor mark + current window per vendor
 ```
 
-Click for **Kam prepnúť teraz** (vendors ranked by headroom, with the limiting window and its
-reset) and all gauges grouped by vendor, with progress bars and reset countdowns. The vendor
+Click for all gauges grouped by vendor, with progress bars and reset countdowns. The vendor
 header shows the subscription behind the limits where it can be read locally: Claude (Keychain
 `rateLimitTier`, e.g. "Max 5×") and Codex (`chatgpt_plan_type` claim of the id_token in
 `~/.codex/auth.json`, e.g. "Plus"). Antigravity exposes no tier through `agy`, Grok is not read. When a source
@@ -131,7 +130,6 @@ section turns grey and shows why. Use it as a personal convenience, not as somet
 | Subscription names | `CLAUDE_TIERS`, `codex_plan()` in `usage.py` |
 | Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
 | Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
-| Which window ranks a vendor in "Kam prepnúť teraz" | `limiting()` in `UsageBar.swift` (the fullest window; for Antigravity only the Gemini group) |
 | Vendor marks and colours | `icons/*.svg`, `vendorGlyph()` / `vendorColor()` in `UsageBar.swift` |
 | Grok billing host | `GROK_CLI_CHAT_PROXY_BASE_URL` (default `https://cli-chat-proxy.grok.com/v1`) |
 | agy timeout / cache | `ANTIGRAVITY_TIMEOUT`, `ANTIGRAVITY_CACHE_TTL` in `usage.py` |
