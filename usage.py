@@ -225,6 +225,7 @@ ANTIGRAVITY_RPC = (
 )
 ANTIGRAVITY_GROUPS = {
     "Gemini Models": "Gemini",
+    "Gemini 4 Argon": "Argon",
     "Claude and GPT models": "Other models",
 }
 ANTIGRAVITY_WINDOWS = {"5h": "5 h", "weekly": "týždeň"}
@@ -376,8 +377,9 @@ def gemini_gauges() -> list[dict]:
     summary = antigravity_local_summary() or antigravity_cli_summary()
     out = []
     rows = sorted(
-        antigravity_buckets(summary), key=lambda t: (t[0] != "Gemini", t[2] != "5h")
-    )  # Gemini group first, 5h first
+        antigravity_buckets(summary),
+        key=lambda t: (t[0] != "Gemini", t[0] != "Argon", t[2] != "5h"),
+    )  # Gemini group first, then Argon, 5h first
     for name, bid, window, rem, reset in rows:
         out.append(
             gauge(
