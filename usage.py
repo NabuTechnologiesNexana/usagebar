@@ -12,8 +12,8 @@ than the menu-bar refresh is reused, so the command does not wait on the network
 for numbers the menu already has. This path does not post the macOS notification.
 
 Sources (each is skipped silently when its credentials are not on this Mac):
-  claude  - the endpoint Claude Code's /usage uses. OAuth token from the Keychain,
-            sent only to api.anthropic.com. 5h session, weekly all-models, weekly per-model.
+  claude  - Claude Code's built-in /usage command in a PTY, using its existing login.
+            Account-wide 5h session, weekly all-models, weekly per-model.
   gemini  - Antigravity quota summary (5h + weekly per model group, shared by the `agy`
             CLI and the IDE): `agy -p /usage --output-format json`, cached briefly. A running
             language server on localhost is tried first when a CSRF token is provided.
@@ -33,21 +33,31 @@ Runs on the system /usr/bin/python3 (3.9) - keep it stdlib-only and 3.9-compatib
 from __future__ import annotations
 
 import argparse
+import fcntl
 import http.client
 import json
 import logging
 import os
+import pty
 import re
+import select
 import shutil
+import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
+import termios
+import time
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 STATE_DIR = Path(
     os.environ.get(
@@ -57,6 +67,7 @@ STATE_DIR = Path(
 NOTIFY_AT = int(os.environ.get("USAGEBAR_NOTIFY_AT", "80"))
 NOTIFIED_FILE = STATE_DIR / "notified.json"
 LAST_OK_FILE = STATE_DIR / "last_ok.json"
+CLAUDE_RETRY_FILE = STATE_DIR / "claude_retry.json"
 ANTIGRAVITY_CACHE = STATE_DIR / "antigravity_cache.json"
 ANTIGRAVITY_CACHE_TTL = (
     120  # a manual "Obnoviť" right after the timer should not spawn agy again
@@ -104,19 +115,6 @@ def find_binary(name: str) -> str | None:
     return None
 
 
-def keychain(service: str, account: str | None = None) -> str | None:
-    cmd = [
-        "security",
-        "find-generic-password",
-        "-s",
-        service,
-        *(["-a", account] if account else []),
-        "-w",
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
-    return r.stdout.strip() if r.returncode == 0 else None
-
-
 def http_json(url: str, headers: dict, body: bytes | None = None) -> dict:
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json", **headers}
@@ -158,58 +156,502 @@ def gauge(
 # --- Claude ------------------------------------------------------------------
 
 
-def claude_gauges() -> list[dict]:
-    raw = keychain("Claude Code-credentials")
-    if not raw:
-        return []
-    token = json.loads(raw)["claudeAiOauth"]["accessToken"]
-    data = http_json(
-        "https://api.anthropic.com/api/oauth/usage",
-        {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
+def claude_state() -> dict:
+    try:
+        state = json.loads(CLAUDE_RETRY_FILE.read_text())
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def claude_backoff() -> dict:
+    state = claude_state()
+    if state.get("source") != "cli":
+        return {}  # an old direct-OAuth cooldown must not suppress the CLI source
+    try:
+        if parse_iso(state["retry_at"]) > datetime.now(timezone.utc):
+            return state
+    except (ValueError, TypeError, LookupError, AttributeError):
+        pass
+    return {}
+
+
+def claude_retry_at(value: str | None) -> datetime:
+    now = datetime.now(timezone.utc)
+    try:
+        seconds = int(value or "")
+        if seconds >= 0:
+            return now + timedelta(seconds=seconds)
+    except (ValueError, OverflowError):
+        pass
+    try:
+        retry = parsedate_to_datetime(value or "")
+        if retry > now:
+            return retry
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return now + timedelta(minutes=5)
+
+
+def claude_text(raw: str) -> str:
+    # Cursor-positioned words need spaces; merely removing ANSI joins labels together.
+    raw = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", raw)
+    raw = re.sub(r"\x1b\[[0-?]*[ -/]*[CG]", " ", raw)
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw).replace("\r", "\n")
+
+
+def claude_reset(description: str) -> str | None:
+    compact = re.sub(r"\s+", "", description)
+    match = re.fullmatch(
+        r"(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{1,2})(?:,|at)?)?"
+        r"(\d{1,2})(?::(\d{2}))?(am|pm)(?:\(([^)]+)\))?",
+        compact,
+        re.IGNORECASE,
     )
-    out = []
-    for lim in data["limits"]:
-        kind = lim["kind"]
-        if kind == "session":
-            short, label = "C", "Claude · 5 h"
-        elif kind == "weekly_all":
-            short, label = "W", "Claude · týždeň"
-        elif kind == "weekly_scoped":
-            model = ((lim.get("scope") or {}).get("model") or {}).get(
-                "display_name", "?"
-            )
-            short, label = model[:1], f"Claude · týždeň {model}"
-        else:
+    if not match:
+        return None
+    try:
+        zone = ZoneInfo(match[6]) if match[6] else datetime.now().astimezone().tzinfo
+        now = datetime.now(zone)
+        hour = int(match[3])
+        minute = int(match[4] or 0)
+        if not 1 <= hour <= 12 or not 0 <= minute < 60:
+            return None
+        hour = hour % 12 + (12 if match[5].lower() == "pm" else 0)
+        reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if match[1]:
+            month = [
+                "jan",
+                "feb",
+                "mar",
+                "apr",
+                "may",
+                "jun",
+                "jul",
+                "aug",
+                "sep",
+                "oct",
+                "nov",
+                "dec",
+            ].index(match[1].lower()) + 1
+            reset = reset.replace(month=month, day=int(match[2]))
+            if reset < now:
+                reset = reset.replace(year=reset.year + 1)
+            if reset - now > timedelta(days=8):
+                return None  # a past or unrecognized calendar reset must not become next year's
+        elif reset <= now:
+            reset += timedelta(days=1)
+        return reset.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+
+
+def claude_parse(raw: str) -> list[dict]:
+    text = claude_text(raw)
+    compact = re.sub(r"\s+", "", text).lower()
+    if any(
+        marker in compact
+        for marker in ("ratelimit", "rate_limit", "toomanyrequests", "error:429")
+    ):
+        raise RuntimeError("Claude CLI usage rate limited; retry in 5 minutes")
+    if "failedtoloadusagedata" in compact:
+        raise RuntimeError(
+            "Claude CLI could not load usage data; retry /usage in Claude"
+        )
+    if any(
+        marker in compact
+        for marker in (
+            "notloggedin",
+            "notauthenticated",
+            "authentication_error",
+        )
+    ):
+        raise RuntimeError("Claude CLI needs login; open Claude and run /login")
+    labels = list(
+        re.finditer(r"Current\s*(session|week)(?:\s*\(([^)]+)\))?", text, re.IGNORECASE)
+    )
+    out = {}
+    for index, label in enumerate(labels):
+        end = labels[index + 1].start() if index + 1 < len(labels) else len(text)
+        block = text[label.end() : end]
+        block = re.split(r"What['’]s\s*contributing", block, flags=re.IGNORECASE)[0]
+        percent = re.search(
+            r"(\d+(?:\.\d+)?)\s*%\s*(used|left|remaining)\b", block, re.IGNORECASE
+        )
+        if not percent:
             continue
-        id_ = (
-            f"claude:{kind}:{model}" if kind == "weekly_scoped" else f"claude:{kind}"
-        )  # scoped gauges must not share a notification key
-        out.append(gauge(id_, short, label, lim["percent"], lim["resets_at"], "claude"))
-    return out
+        used = float(percent[1])
+        if not 0 <= used <= 100:
+            raise ValueError("Claude CLI returned an invalid usage percentage")
+        if percent[2].lower() != "used":
+            used = 100 - used
+        model = (label[2] or "").strip()
+        if label[1].lower() == "session":
+            kind, short, title = "session", "C", "5 h"
+        elif not model or re.sub(r"\s+", "", model).lower() == "allmodels":
+            kind, short, title = "weekly_all", "W", "týždeň"
+        else:
+            kind, short, title = f"weekly_scoped:{model}", model[:1], f"týždeň {model}"
+        reset = re.search(r"Resets?\s*([^\n]+)", block, re.IGNORECASE)
+        reset_at = claude_reset(reset[1]) if reset else None
+        g = gauge(
+            f"claude:{kind}", short, f"Claude · {title}", used, reset_at, "claude"
+        )
+        if reset:
+            g["reset_description"] = reset[1].strip()
+        out[g["id"]] = g
+    if not out:
+        raise ValueError("Claude CLI /usage returned no account quota percentages")
+    return list(out.values())
 
 
-CLAUDE_TIERS = {
-    "max_5x": "Max 5×",
-    "max_20x": "Max 20×",
-    "max": "Max",
-    "pro": "Pro",
-    "team": "Team",
-    "enterprise": "Enterprise",
-}
+def claude_screen(raw: str) -> str:
+    """Replay Claude's bounded terminal viewport so trust decisions use the selected row."""
+    rows, columns = 200, 160
+    lines = [[" "] * columns for _ in range(rows)]
+    row = column = 0
+    saved = (0, 0)
+    tokens = re.findall(
+        r"\x1b(?:\[[0-?]*[ -/]*[@-~]?|\][\s\S]*?(?:\x07|\x1b\\|$)|.)|[^\x1b]+", raw
+    )
+    for token in tokens:
+        if token.startswith("\x1b["):
+            command, parameters = token[-1], token[2:-1]
+            if command not in "ABCDGHfKJ" or re.search(r"[^0-9;]", parameters):
+                continue
+            values = [min(int(value or 0), rows) for value in parameters.split(";")[:2]]
+            mode, amount = values[0], max(1, values[0])
+            column = min(column, columns - 1)
+            if command == "A":
+                row = max(0, row - amount)
+            elif command == "B":
+                row = min(rows - 1, row + amount)
+            elif command == "C":
+                column = min(columns - 1, column + amount)
+            elif command == "D":
+                column = max(0, column - amount)
+            elif command == "G":
+                column = min(columns - 1, amount - 1)
+            elif command in "Hf":
+                row = min(rows - 1, amount - 1)
+                column = min(
+                    columns - 1, max(1, values[1] if len(values) > 1 else 1) - 1
+                )
+            elif mode in (0, 1, 2):
+                cursor = row * columns + column
+                start = row * columns if command == "K" else 0
+                end = (row + 1) * columns if command == "K" else rows * columns
+                for cell in range(
+                    cursor if mode == 0 else start, cursor + 1 if mode == 1 else end
+                ):
+                    lines[cell // columns][cell % columns] = " "
+        elif token == "\x1b7":
+            saved = row, column
+        elif token == "\x1b8":
+            row, column = saved
+        elif not token.startswith("\x1b"):
+            for character in token:
+                if character == "\r":
+                    column = 0
+                elif character == "\n":
+                    row, column = row + 1, 0
+                elif character == "\b":
+                    column = max(0, column - 1)
+                elif character == "\t":
+                    column = min(columns - 1, (column // 8 + 1) * 8)
+                elif ord(character) >= 32 and ord(character) != 127:
+                    if unicodedata.combining(character):
+                        if column:
+                            lines[row][min(column - 1, columns - 1)] += character
+                        continue
+                    width = (
+                        2
+                        if unicodedata.east_asian_width(character) in ("W", "F")
+                        or 0x1F300 <= ord(character) <= 0x1FAFF
+                        else 1
+                    )
+                    if column + width > columns:
+                        row, column = row + 1, 0
+                    if row >= rows:
+                        lines.pop(0)
+                        lines.append([" "] * columns)
+                        row = rows - 1
+                    lines[row][column] = character
+                    if width == 2:
+                        lines[row][column + 1] = ""
+                    column += width
+                if row >= rows:
+                    lines.pop(0)
+                    lines.append([" "] * columns)
+                    row = rows - 1
+    return "\n".join("".join(line).rstrip() for line in lines).rstrip()
+
+
+def claude_trust_key(screen: str) -> bytes | None:
+    lines = screen.splitlines()
+    for option_row, line in enumerate(lines):
+        if "yes,itrustthisfolder" not in re.sub(r"\s+", "", line).lower():
+            continue
+        first = last = option_row
+        while first > 0 and lines[first - 1].strip():
+            first -= 1
+        while last + 1 < len(lines) and lines[last + 1].strip():
+            last += 1
+        for marker_row in range(first, last + 1):
+            if "❯" in lines[marker_row]:
+                if marker_row == option_row:
+                    return b"\r"
+                return b"\x1b[B" if marker_row < option_row else b"\x1b[A"
+    return None
+
+
+def claude_capture(binary: str, timeout: float = 25) -> str:
+    # Match CodexBar's CLI source: built-in /usage owns auth; UsageBar never reads login secrets.
+    directory = STATE_DIR / "ClaudeProbe"
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise RuntimeError("Claude probe directory must not be a symlink")
+    environment = {
+        k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")
+    }
+    for key in (
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        "CLAUDECODE",
+    ):
+        environment.pop(key, None)
+    environment.update(
+        TERM="xterm-256color", DISABLE_AUTOUPDATER="1", PWD=str(directory)
+    )
+    arguments = [
+        binary,
+        "--allowed-tools",
+        "",
+        "--strict-mcp-config",
+        "--settings",
+        '{"disableAllHooks":true,"remoteControlAtStartup":false}',
+    ]
+    master, slave = pty.openpty()
+    process = None
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 200, 160, 0, 0))
+        # Acquire /dev/tty in a fresh interpreter, avoiding threaded preexec_fn callbacks.
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import fcntl,os,sys,termios; fcntl.ioctl(0,termios.TIOCSCTTY,0); os.execv(sys.argv[1],sys.argv[1:])",
+                *arguments,
+            ],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=directory,
+            env=environment,
+            start_new_session=True,
+        )
+        os.close(slave)
+        slave = -1
+        ready_at = time.monotonic() + 2
+        deadline = ready_at + timeout
+        output = bytearray()
+        query_tail = b""
+        sent = dirty = trust_pending = False
+        retried = False
+        sent_at = None
+        trust_keys = 4
+        confirmations = set()
+        last_output = time.monotonic()
+        settled = None
+        screen = ""
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.06)[0]:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > 2_000_000:
+                    raise RuntimeError("Claude CLI usage output exceeded 2 MB")
+                query = query_tail + chunk
+                if b"\x1b[6n" in query:
+                    os.write(master, b"\x1b[1;1R")
+                query_tail = query[-3:]
+                last_output = time.monotonic()
+                dirty = True
+            now = time.monotonic()
+            if dirty and (now - last_output >= 0.2 or process.poll() is not None):
+                try:
+                    screen = claude_screen(output.decode("utf-8"))
+                except UnicodeDecodeError:
+                    continue
+                dirty = False
+                compact = re.sub(r"\s+", "", screen).lower()
+                if any(
+                    word in compact
+                    for word in (
+                        "password",
+                        "keychain",
+                        "selectloginmethod",
+                        "let'sgetyousignedin",
+                        "pastethecode",
+                                    "notloggedin",
+                    )
+                ):
+                    raise RuntimeError(
+                        "Claude CLI needs interactive login; open Claude and sign in"
+                    )
+                trust_key = claude_trust_key(screen)
+                trust_pending = trust_key is not None or any(
+                    marker in compact
+                    for marker in (
+                        "quicksafetycheck:",
+                        "doyoutrustthefilesinthisfolder?",
+                        "readytocodehere?",
+                    )
+                )
+                if trust_pending:
+                    if trust_key is not None and trust_keys:
+                        os.write(master, trust_key)
+                        trust_keys -= 1
+                        ready_at = now + 2
+                else:
+                    if sent:
+                        if "failedtoloadusagedata" in compact:
+                            return screen
+                        try:
+                            claude_parse(screen)
+                            if settled is None:
+                                settled = now + 2
+                        except ValueError:
+                            pass
+                        except RuntimeError:
+                            return screen
+                    markers = ("pressentertocontinue",)
+                    if sent:
+                        markers += ("showplan", "showsessioncost,planusage")
+                    for marker in markers:
+                        if marker in compact and marker not in confirmations:
+                            os.write(master, b"\r")
+                            confirmations.add(marker)
+                            if not sent:
+                                ready_at = now + 2
+            if not sent and not trust_pending and not dirty and now >= ready_at:
+                os.write(master, b"/usage\r")
+                sent = True
+                sent_at = now
+                output.clear()
+                screen = ""
+                deadline = now + timeout
+            elif (
+                sent
+                and not retried
+                and not dirty
+                and sent_at is not None
+                and now - sent_at >= 2
+            ):
+                compact = re.sub(r"\s+", "", screen).lower()
+                # Claude can paint startup before its input handler is ready. CodexBar
+                # retries /usage once when the first capture is still the startup screen.
+                if (
+                    "claudecodev" in compact
+                    and re.search(r"(?m)^\s*❯\s*$", screen)
+                    and not any(
+                        marker in compact
+                        for marker in (
+                            "currentsession",
+                            "currentweek",
+                            "loadingusage",
+                            "failedtoloadusagedata",
+                            "settingsstatusconfig",
+                        )
+                    )
+                ):
+                    os.write(master, b"/usage\r")
+                    retried = True
+                    output.clear()
+                    screen = ""
+                    deadline = now + timeout
+            if settled is not None and now >= settled:
+                return claude_screen(output.decode("utf-8", errors="replace"))
+            if process.poll() is not None:
+                break
+        if sent and output:
+            return claude_screen(output.decode("utf-8", errors="replace"))
+        raise RuntimeError(
+            "Claude CLI usage probe timed out; open Claude and try /usage"
+        )
+    finally:
+        if slave >= 0:
+            os.close(slave)
+        if process is not None and process.poll() is None:
+            try:
+                os.write(master, b"/exit\r")
+            except OSError:
+                pass
+        os.close(master)
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if process.poll() is None:
+                    process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            # The probe owns this group. Reap children even if the CLI root exited first.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                if process.poll() is None:
+                    process.kill()
+            process.wait(timeout=5)
+
+
+def claude_gauges() -> list[dict]:
+    backoff = claude_backoff()
+    if backoff:
+        raise RuntimeError(f"Rate limited; retry after {backoff['retry_at']}")
+    binary = find_binary("claude")
+    if not binary:
+        return []
+    text = claude_capture(binary)
+    try:
+        gauges = claude_parse(text)
+    except RuntimeError as exc:
+        if "rate limited" in str(exc):
+            try:
+                write_private(
+                    CLAUDE_RETRY_FILE,
+                    {
+                        **claude_state(),
+                        "source": "cli",
+                        "retry_at": claude_retry_at(None).isoformat(timespec="seconds"),
+                    },
+                )
+            except OSError:
+                pass
+        raise
+    plan = re.search(
+        r"Claude\s+(Max|Pro|Team|Enterprise)\b", claude_text(text), re.IGNORECASE
+    )
+    try:
+        write_private(
+            CLAUDE_RETRY_FILE,
+            {"source": "cli", "plan": plan[1].capitalize() if plan else None},
+        )
+    except OSError:
+        pass
+    return gauges
 
 
 def claude_plan() -> str | None:
-    """Plan name from the Keychain item Claude Code writes at login (rateLimitTier, e.g. default_claude_max_5x)."""
-    raw = keychain("Claude Code-credentials")
-    if not raw:
-        return None
-    oauth = json.loads(raw).get("claudeAiOauth") or {}
-    tier = str(oauth.get("rateLimitTier") or "").lower()
-    for key, name in CLAUDE_TIERS.items():
-        if tier.endswith(key):
-            return name
-    sub = str(oauth.get("subscriptionType") or "")
-    return sub.capitalize() or None
+    return claude_state().get("plan")
 
 
 # --- Gemini / Antigravity ----------------------------------------------------
@@ -330,20 +772,19 @@ def antigravity_cli_summary() -> dict:
 def antigravity_buckets(
     summary: dict | None,
 ) -> list[tuple[str, str, str, float, str | None]]:
-    """(group name, bucket id, window key, remaining fraction, reset) - raises on anything unexpected,
-    so a renamed field surfaces as a ⚠ row instead of a silent 0 %."""
+    """Keep provider quota groups distinct as new models gain independent limits.
+
+    Invalid buckets still fail the source instead of inventing a zero usage window.
+    """
     groups = (summary or {}).get("groups")
     if not groups:
         raise ValueError("odpoveď bez groups")
     out = []
     for group in groups:
-        name = ANTIGRAVITY_GROUPS.get(
-            group.get("displayName") or group.get("name") or "", None
-        )
-        if name is None:
-            raise ValueError(
-                f"neznáma skupina {group.get('displayName') or group.get('name')!r}"
-            )
+        provider_name = group.get("displayName") or group.get("name")
+        if not isinstance(provider_name, str) or not provider_name.strip():
+            raise ValueError("skupina bez názvu")
+        name = ANTIGRAVITY_GROUPS.get(provider_name, provider_name)
         buckets = group.get("buckets")
         if not buckets:
             raise ValueError(f"skupina {name} bez buckets")
@@ -879,6 +1320,13 @@ def _sample_age(gauges: list[dict]) -> float | None:
     now = datetime.now(timezone.utc)
     ages = []
     for g in gauges:
+        reset = g.get("reset")
+        if reset:
+            try:
+                if parse_iso(reset) <= now:
+                    return None  # this sample belongs to the previous window
+            except (ValueError, TypeError):
+                return None
         raw = g.get("fetched_at")
         if not isinstance(raw, str) or not raw:
             return None
@@ -1005,7 +1453,9 @@ def window_name(g: dict) -> str:
         return raw
     for src, dst in _WINDOW_WORDS:
         right = right.replace(src, dst)
-    prefix = {"Gemini": "gemini ", "Other models": "other models "}.get(left, "")
+    prefix = {"Gemini": "gemini ", "Other models": "other models "}.get(
+        left, f"{left} " if g.get("group") == "gemini" else ""
+    )
     return f"{prefix}{right}".strip()
 
 
@@ -1102,6 +1552,8 @@ def _blocks(views: list[dict], tty: bool, show_empty: bool) -> str:
             meter = _paint(_meter_code(used), f"{used:>3}%  {_bar(used)}", tty)
             stale = _paint("2", "  stale", tty) if g.get("stale") else ""
             lines.append(f"  {window_name(g):<{width}}  {meter}{stale}")
+        if view["windows"] and view.get("error"):
+            lines.append(f"  {view['error']}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n"
 

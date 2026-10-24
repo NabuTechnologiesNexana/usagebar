@@ -1,6 +1,6 @@
 # UsageBar
 
-macOS menubar gauge for AI-coding subscription limits: **Claude Code** (5 h session,
+macOS menubar gauge for AI-coding subscription limits: **Claude** (desktop + CLI; 5 h session,
 weekly, weekly per-model), **Gemini / Antigravity** (`agy` CLI + IDE share one quota),
 (5 h + weekly per model group — Gemini, and Claude/GPT used through Antigravity),
 **Codex** (5 h + weekly, once `codex login` has been run), and **Grok** (weekly credit
@@ -12,8 +12,8 @@ No dependencies: one Python script (system `/usr/bin/python3`) + one Swift file 
 ```
 
 Click for all gauges grouped by vendor, with progress bars and reset countdowns. The vendor
-header shows the subscription behind the limits where it can be read locally: Claude (Keychain
-`rateLimitTier`, e.g. "Max 5×") and Codex (`chatgpt_plan_type` claim of the id_token in
+header shows the subscription behind the limits where available: Claude (the CLI's usage
+panel, e.g. "Max") and Codex (`chatgpt_plan_type` claim of the id_token in
 `~/.codex/auth.json`, e.g. "Plus"). Antigravity exposes no tier through `agy`, Grok is not read. When a source
 fails, its last good numbers stay in the menu greyed out with "zastarané · pred N min" and the
 reason as a ⚠ row; nothing is invented. A macOS notification fires once per limit per reset
@@ -69,21 +69,34 @@ usagebar grok
 ```
 
 `antigravity` also accepts `gemini` and `agy`. A failed fetch keeps the last good numbers and marks the line `stale`.
+The CLI also shows the fetch error beside stale values. Samples whose reset has passed are
+refetched even when they are less than five minutes old; an unsuccessful fetch preserves
+the old value as stale rather than assuming the new window starts at 0 %.
 
 ## Where the numbers come from
 
 | Source | Credentials (read only, never stored by this tool) | Endpoint |
 |---|---|---|
-| Claude | Keychain item `Claude Code-credentials` (written by Claude Code login) | `api.anthropic.com/api/oauth/usage` — same as `/usage` in Claude Code |
+| Claude | Existing Claude Code login, managed by Claude itself; UsageBar never reads its tokens or Keychain | Built-in `/usage` inside a PTY, showing account quotas shared with the desktop app |
 | Gemini / Antigravity | the `agy` login itself: `agy -p /usage --output-format json` (agy 1.1.11+), cached 120 s; not run when `oauth2.googleapis.com` is unreachable (offline, agy would open a browser login) | agy's own quota command — the same 5 h + weekly per-group numbers the IDE shows. A running language server is asked first only when `ANTIGRAVITY_CSRF_TOKEN` is set (agy 1.2+ rejects the localhost RPC without it). The Cloud Code endpoint is deliberately not used: it answers "100 % remaining" for everything |
 | Codex | `~/.codex/auth.json` (only when the `codex` CLI is installed and logged in via ChatGPT) | `chatgpt.com/backend-api/wham/usage` — same call CodexBar makes |
 | Grok | `~/.grok/auth.json` (only when the `grok` CLI is installed and logged in with `grok login`; API-key logins have no windows and are skipped). The file is read, never written. A token near expiry is renewed by `grok models`, so refresh-token rotation stays inside the CLI | `cli-chat-proxy.grok.com/v1/billing?format=credits` for the weekly window `/usage` shows, and `/v1/billing` for the monthly allowance. Override the host with `GROK_CLI_CHAT_PROXY_BASE_URL`, the same variable the CLI uses |
 
 Tokens are sent only to their own vendor's API. Grok's token goes only to `cli-chat-proxy.grok.com`. `~/Library/Application Support/UsageBar/`
-(mode 600) holds the agy quota cache and the last good gauges per source. Nothing else leaves
+(mode 600) holds the agy quota cache, Claude retry/plan metadata, and the last good gauges per source. Nothing else leaves
 the machine. All endpoints are internal/undocumented and may change without notice — an
 unexpected response shape is reported as a `⚠` row (never rendered as 0 %), the last good
 numbers stay greyed out, the other sources keep working.
+
+Claude uses the same CLI PTY approach as [CodexBar's Claude source](https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/Providers/Claude/ClaudeCLISession.swift).
+The probe sends only the built-in `/usage` command, with tools, MCP, hooks, remote control,
+and automatic updates disabled. It runs in its own empty `ClaudeProbe` directory and stops
+on login/password prompts. Claude owns its existing login and token refresh; UsageBar no
+longer reads its Keychain item. Sign in to the same Claude account in the CLI and desktop
+app once; you can then use either app while UsageBar refreshes the shared account quota.
+If the CLI itself reports rate limiting, UsageBar waits five minutes before retrying and
+keeps the previous sample explicitly stale. The CLI path cannot bypass an account-wide
+rate limit. Login/setup errors require opening Claude interactively.
 
 ## Hooking up Codex
 
@@ -127,8 +140,8 @@ section turns grey and shows why. Use it as a personal convenience, not as somet
 | What | Where |
 |---|---|
 | Threshold for notifications | `NOTIFY_AT` in `usage.py` (or env `USAGEBAR_NOTIFY_AT`) |
-| Subscription names | `CLAUDE_TIERS`, `codex_plan()` in `usage.py` |
-| Antigravity group labels | `ANTIGRAVITY_GROUPS` in `usage.py` |
+| Subscription names | `claude_plan()`, `codex_plan()` in `usage.py` |
+| Antigravity group label aliases (new groups retain the provider's name and reported windows) | `ANTIGRAVITY_GROUPS` in `usage.py` |
 | Which gauges appear in the menubar | `headline` in `UsageBar.swift` |
 | Vendor marks and colours | `icons/*.svg`, `vendorGlyph()` / `vendorColor()` in `UsageBar.swift` |
 | Grok billing host | `GROK_CLI_CHAT_PROXY_BASE_URL` (default `https://cli-chat-proxy.grok.com/v1`) |
