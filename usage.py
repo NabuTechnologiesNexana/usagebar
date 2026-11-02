@@ -638,7 +638,7 @@ def claude_gauges() -> list[dict]:
                 pass
         raise
     plan = re.search(
-        r"Claude\s+(Max|Pro|Team|Enterprise)\b", claude_text(text), re.IGNORECASE
+        r"Claude\s+(Ultra|Max|Pro|Team|Enterprise)\b", claude_text(text), re.IGNORECASE
     )
     try:
         write_private(
