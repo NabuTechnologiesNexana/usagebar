@@ -30,6 +30,9 @@ func headlineGauge(_ gauges: [Gauge], _ id: String) -> Gauge? {
     if id == "grok:weekly" {
         return gauges.first { $0.id == "grok:monthly" } ?? gauges.first { $0.id == "grok:ondemand" }
     }
+    if id == "claude:session" {  // Ultra has no 5 h window; show the tightest weekly limit instead
+        return gauges.filter { $0.group == "claude" }.max { $0.percent < $1.percent }
+    }
     return nil
 }
 
